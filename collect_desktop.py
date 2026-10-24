@@ -39,6 +39,7 @@ cache_read_tokens, reasoning_tokens, cost_usd.
 from __future__ import annotations
 
 import argparse
+import calendar
 import fcntl
 import hashlib
 import json
@@ -79,13 +80,58 @@ def state_dir(home: Path | None = None) -> Path:
 
 
 # --------------------------------------------------------------------- helpers
-def log_epoch(ts: str) -> float:
-    """Naive log timestamp → epoch seconds (local time unless LOG_UTC_ENV=1)."""
+_LOG_UTC: bool | None = None
+
+
+def _env_utc() -> bool | None:
+    raw = (os.environ.get(LOG_UTC_ENV) or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def detect_log_is_utc(log_path: Path) -> bool:
+    """Decide the log timezone by comparing its newest line with the clock.
+
+    The log is written in the host's local time. On a UTC host both readings are
+    identical; on a +03:00 host the UTC reading is three hours off. The reading
+    that lands closer to "now" wins. ``HERMES_AI_GATEWAY_LOG_UTC`` overrides.
+    """
+    forced = _env_utc()
+    if forced is not None:
+        return forced
+    try:
+        with log_path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 8192))
+            tail = fh.read().decode("utf-8", "replace").splitlines()
+        stamp = None
+        for line in reversed(tail):
+            m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+            if m:
+                stamp = m.group(1)
+                break
+        if not stamp:
+            return False
+        parsed = time.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+        now = time.time()
+        return abs(calendar.timegm(parsed) - now) < abs(time.mktime(parsed) - now)
+    except Exception:
+        return False
+
+
+def log_epoch(ts: str, utc: bool | None = None) -> float:
+    """Naive log timestamp → epoch seconds.
+
+    Uses the timezone decided by detect_log_is_utc() (or the explicit argument);
+    when nothing was detected the host's local time is assumed.
+    """
     parsed = time.strptime(ts, "%Y-%m-%d %H:%M:%S")
-    if (os.environ.get(LOG_UTC_ENV) or "").strip() in {"1", "true", "yes"}:
-        import calendar
-        return calendar.timegm(parsed)
-    return time.mktime(parsed)
+    use_utc = utc if utc is not None else (_LOG_UTC if _LOG_UTC is not None else bool(_env_utc()))
+    return calendar.timegm(parsed) if use_utc else time.mktime(parsed)
 
 
 def _iso(epoch: float) -> str:
@@ -368,6 +414,8 @@ def coverage(home: Path, since_str: str, only_desktop: bool) -> int:
     state = state_dir(home)
     log_ids: set[str] = set()
     log_path = home / "logs" / "agent.log"
+    global _LOG_UTC
+    _LOG_UTC = detect_log_is_utc(log_path) if log_path.exists() else bool(_env_utc())
     if log_path.exists():
         for raw in log_path.open("rb"):
             m = API_CALL_RE.match(raw.decode("utf-8", "replace"))
@@ -427,6 +475,8 @@ def main(argv: list[str] | None = None) -> int:
 def _run(home: Path, state: Path, state_file: Path, ledger: Path, pending_file: Path,
          missing_file: Path, args) -> int:
     log_path = home / "logs" / "agent.log"
+    global _LOG_UTC
+    _LOG_UTC = detect_log_is_utc(log_path) if log_path.exists() else bool(_env_utc())
     if not log_path.exists():
         print(f"log yok: {log_path}")
         return 0

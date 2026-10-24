@@ -228,18 +228,40 @@ check("F6e: pending survives a crash before the offset write",
       crashed and len(pend) == 1, f"crashed={crashed} pending={len(pend)}")
 
 # --- F6g: log timestamps are local time unless LOG_UTC=1 -------------------
+import calendar  # noqa: E402
 import time as _time  # noqa: E402
 
-local = cd.log_epoch("2026-10-24 10:00:00")
-expected = _time.mktime(_time.strptime("2026-10-24 10:00:00", "%Y-%m-%d %H:%M:%S"))
-check("F6g: log_epoch uses local time by default", local == expected, f"{local} != {expected}")
+# the timezone is decided by comparing the newest log line with the clock, so
+# make a fixture whose last line is "now" and check the reading that follows.
+_fixture = cd.Path(tempfile.mkdtemp()) / "agent.log"
+_fixture.write_text(_time.strftime("%Y-%m-%d %H:%M:%S", _time.gmtime()) + " INFO x\n",
+                    encoding="utf-8")
+_detected = cd.detect_log_is_utc(_fixture)
+_stamp = "2026-10-24 10:00:00"
+_expected = (calendar.timegm(_time.strptime(_stamp, "%Y-%m-%d %H:%M:%S")) if _detected
+             else _time.mktime(_time.strptime(_stamp, "%Y-%m-%d %H:%M:%S")))
+check("F6g: default reading follows the detected log timezone",
+      cd.log_epoch(_stamp, utc=_detected) == _expected, f"detected_utc={_detected}")
+
+os.environ[cd.LOG_UTC_ENV] = "0"
+try:
+    _forced_local = cd.detect_log_is_utc(_fixture)
+finally:
+    os.environ.pop(cd.LOG_UTC_ENV, None)
+check("F6g: LOG_UTC=0 forces local even for a UTC-looking log", _forced_local is False,
+      str(_forced_local))
+
+os.environ[cd.LOG_UTC_ENV] = "1"
+try:
+    _forced_utc = cd.detect_log_is_utc(_fixture)
+finally:
+    os.environ.pop(cd.LOG_UTC_ENV, None)
+check("F6g: LOG_UTC=1 forces UTC", _forced_utc is True, str(_forced_utc))
 os.environ[cd.LOG_UTC_ENV] = "1"
 try:
     utc = cd.log_epoch("2026-10-24 10:00:00")
 finally:
     os.environ.pop(cd.LOG_UTC_ENV, None)
-import calendar  # noqa: E402
-
 check("F6g: HERMES_AI_GATEWAY_LOG_UTC=1 switches to UTC",
       utc == calendar.timegm(_time.strptime("2026-10-24 10:00:00", "%Y-%m-%d %H:%M:%S")),
       str(utc))
