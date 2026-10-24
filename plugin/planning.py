@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 import threading
 import time
 import urllib.request
@@ -142,7 +143,7 @@ def _api_key() -> str | None:
     return None
 
 
-def _fetch_endpoints(model: str) -> dict | None:
+def _fetch_endpoints(model: str, timeout: float = 20.0) -> dict | None:
     key = _api_key()
     if not key:
         return None
@@ -150,36 +151,98 @@ def _fetch_endpoints(model: str) -> dict | None:
         f"{BASE}/models/{model}/endpoints",
         headers={"Authorization": "Bearer " + key, "User-Agent": "hermes-ai-gateway-router"},
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())["data"]
 
 
-def stats(model: str, ttl: float = DEFAULT_STATS_TTL) -> tuple[list[dict], bool]:
-    """(endpoint listesi, bayat_mı). Bayatsa arka planda yenilenir."""
-    p = _stats_path(model)
-    data = {}
+STATS_FETCH_TIMEOUT_S = 3.0      # cold start sits on the request path
+STATS_REFRESH_TIMEOUT_S = 20.0   # background refresh may take its time
+NEGATIVE_CACHE_S = 60.0          # do not retry a failed fetch for a minute
+_NEG_CACHE_TS: dict[str, float] = {}
+_SYNC_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _write_stats(path: Path, endpoints: list[dict], fetched_at: float | None = None) -> None:
+    """Write the stats cache atomically (unique temp file in the same directory).
+
+    A crash or a full disk must never leave a truncated JSON file: the reader
+    would treat it as "no cache" and pay another synchronous fetch.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".stats-", suffix=".json")
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": fetched_at or time.time(), "endpoints": endpoints},
+                      fh, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
     except Exception:
-        data = {}
-    fetched = float(data.get("fetched_at") or 0)
-    endpoints = data.get("endpoints") or []
-    if not endpoints:
-        # Hiç cache yok: ilk istek beklemeyi göze alır (tek seferlik, ~0.3s).
         try:
-            payload = _fetch_endpoints(model)
-            if payload:
-                endpoints = payload.get("endpoints") or []
-                p.write_text(json.dumps({"fetched_at": time.time(), "endpoints": endpoints},
-                                        ensure_ascii=False), encoding="utf-8")
-                return endpoints, False
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _read_stats(path: Path) -> tuple[list[dict], float]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return (data.get("endpoints") or []), float(data.get("fetched_at") or 0.0)
+    except Exception:
+        return [], 0.0
+
+
+def _sync_lock(model: str) -> threading.Lock:
+    with _LOCK:
+        return _SYNC_LOCKS.setdefault(model, threading.Lock())
+
+
+def stats(model: str, ttl: float = DEFAULT_STATS_TTL) -> tuple[list[dict], bool]:
+    """(endpoint list, stale?) — never blocks more than one cold fetch.
+
+    Cache hit  → returned as-is; a stale file is refreshed in the background.
+    Cache miss → exactly one thread per model fetches synchronously with a 3 s
+                 timeout; every other thread gets ``[]`` at once. A failed or
+                 empty fetch is negatively cached for 60 s, and an
+                 ``endpoints: []`` file is not treated as a valid cache.
+    """
+    p = _stats_path(model)
+    endpoints, fetched = _read_stats(p)
+    if endpoints:
+        fresh = (time.time() - fetched) < ttl
+        if not fresh:
+            _refresh_async(model, p)
+        return endpoints, not fresh
+
+    if time.time() - float(_NEG_CACHE_TS.get(model) or 0.0) < NEGATIVE_CACHE_S:
+        return [], False
+
+    lock = _sync_lock(model)
+    if not lock.acquire(blocking=False):
+        return [], False    # another thread is already fetching this model
+
+    try:
+        endpoints, fetched = _read_stats(p)      # someone may have filled it meanwhile
+        if endpoints:
+            return endpoints, (time.time() - fetched) >= ttl
+        try:
+            payload = _fetch_endpoints(model, timeout=STATS_FETCH_TIMEOUT_S)
+            eps = (payload or {}).get("endpoints") or []
         except Exception as exc:
             log.debug("ai-gateway-router: %s ilk istatistik alınamadı: %s", model, exc)
-        return [], False
-    fresh = (time.time() - fetched) < ttl
-    if not fresh:
-        _refresh_async(model, p)
-    return endpoints, not fresh
+            _NEG_CACHE_TS[model] = time.time()
+            return [], False
+        if not eps:
+            _NEG_CACHE_TS[model] = time.time()
+            return [], False
+        _NEG_CACHE_TS.pop(model, None)
+        try:
+            _write_stats(p, eps)
+        except Exception as exc:
+            log.warning("ai-gateway-router: %s stats yazılamadı: %s", model, exc)
+        return eps, False
+    finally:
+        lock.release()
 
 
 def _refresh_async(model: str, path: Path) -> None:
@@ -190,10 +253,11 @@ def _refresh_async(model: str, path: Path) -> None:
 
     def _work() -> None:
         try:
-            data = _fetch_endpoints(model)
-            if data:
-                path.write_text(json.dumps({"fetched_at": time.time(), "endpoints": data["endpoints"]},
-                                           ensure_ascii=False), encoding="utf-8")
+            data = _fetch_endpoints(model, timeout=STATS_REFRESH_TIMEOUT_S)
+            eps = (data or {}).get("endpoints") or []
+            if eps:
+                _write_stats(path, eps)
+                _NEG_CACHE_TS.pop(model, None)
         except Exception as exc:
             log.debug("ai-gateway-router: %s istatistik yenilenemedi: %s", model, exc)
         finally:
