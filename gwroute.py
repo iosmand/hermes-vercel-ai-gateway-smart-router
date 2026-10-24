@@ -2,7 +2,14 @@
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
-"""gwroute — Vercel AI Gateway için maliyet + gecikme + uptime temelli sağlayıcı seçici.
+"""gwroute — DEV-ONLY cost/latency explorer for the Vercel AI Gateway.
+
+**Not part of the plugin and not imported by it.** The production path is
+``plugin/planning.py`` (``rank()`` / ``build_gateway()``); this script reads the
+same catalog and prints a ranking table, which is handy when tuning a rule by
+hand. Its scoring is an older approximation and differs from ``planning._score``
+in several places — see the list in README.md ("gwroute differences"). Do not
+copy numbers from here into a rule without re-checking them against the plugin.
 
 v2 modeli: her sağlayıcı için "bu iş yükünü çalıştırmanın toplam bedeli" tek bir
 sayıya indirilir ve o sayı üzerinden sıralanır.

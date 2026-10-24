@@ -62,6 +62,7 @@ nesnesini okur. Her model kuralı şu alanları kullanabilir:
       "max_candidates": 4,
       "time_value_cents_per_s": 0.15,
       "session_affinity": true,
+      "session_ttl_s": 21600,
       "stats_ttl_s": 600
     }
   }
@@ -69,7 +70,17 @@ nesnesini okur. Her model kuralı şu alanları kullanabilir:
 ```
 
 `mode:auto`, endpoint katalogundaki precision bildiriminin dağılımına göre
-`strict`, `exclude` veya `any` davranışını seçer. Gerçek çalışma kuralı ve
+`strict`, `exclude` veya `any` davranışını seçer.
+
+`session_ttl_s` oturum kilidinin **boşta** kalma süresidir (varsayılan 6 saat) ve
+Vercel'in 5 dakikalık `sessionAffinity` piniyle aynı şey değildir: pin 5 dakika,
+bizim kilidimiz yalnız "bu oturum hangi sağlayıcıyı kullandı" bilgisini taşır.
+Pin'den kısa seçilirse sıralama hâlâ pinli sağlayıcıdan uzaklaşabilir; bu yüzden
+`session_ttl_s` ≥ pin penceresi olmalı (ayrıntı: İngilizce README).
+
+Bir modelin **tüm** sağlayıcıları karantinadaysa plugin yalnız `has` gönderir
+(precision korunur), `order`/`only` göndermez ve model başına dakikada bir kez
+WARNING yazar; 10 dakikalık karantina bitince sıralama kendiliğinden döner. Gerçek çalışma kuralı ve
 API anahtarı public depoya konmamalıdır.
 
 ## Durum dosyaları ve gizlilik
@@ -78,6 +89,10 @@ Aşağıdaki dosyalar yalnızca `$HERMES_HOME/ai-gateway-router/` altında tutul
 ve `.gitignore` ile dışlanır: `rules.json`, `plans.json`, `stats/`,
 `ledger*.jsonl`, `sessions.json`, `strikes.json`, `demoted.json`,
 `strike_pause.json`, `collect_desktop.*`, `generation_truth.jsonl` ve loglar.
+
+`collect_desktop.py`, log saat dilimini açılışta son satırı saatle
+karşılaştırarak belirler (bu makinede UTC); `HERMES_AI_GATEWAY_LOG_UTC=1|0` ile
+elle sabitlenebilir.
 
 Anahtar `AI_GATEWAY_API_KEY` ortam değişkeninden veya
 `$HERMES_HOME/.env` dosyasından okunur. Araçlar anahtar değerini yazdırmaz.

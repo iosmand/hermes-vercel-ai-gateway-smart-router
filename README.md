@@ -22,6 +22,10 @@ Türkçe sürüm: [README.tr.md](README.tr.md).
    failover it moves the session lock (`ledger.jsonl` records the move).
 7. Records provider failures as strikes and quarantines a failing provider for
    `(model, provider)` only.
+8. If every provider of a model is quarantined, sends **only** `has` — the
+   precision filter stays enforced, `order`/`only` are omitted, and one WARNING
+   per model per minute is logged. Ranking resumes when a quarantine expires
+   (10 minutes) or `demoted.json` is removed.
 
 ## Requirements
 
@@ -80,6 +84,7 @@ rule) to be routed at all.
 | `model_context` | int | max over providers | reference context for the shrink penalty | `planning._quality` |
 | `max_candidates` | int | 4 | providers placed in `order`/`only` | `planning.build_gateway` |
 | `session_affinity` | bool | `true` | pin one provider per session | idem |
+| `session_ttl_s` | float | 21600 | idle TTL of that pin, in seconds | `planning.locked_provider` |
 | `stats_ttl_s` | float | 600 | catalog cache TTL (seconds) | `planning.stats` |
 | `quality.*` | object | see `DEFAULT_QUALITY` | FP4 / unknown-precision / structured-output / context penalties | `planning._quality` |
 
@@ -99,6 +104,52 @@ quality     = product of the penalties in quality.* (lower = worse)
 The provider with the lowest score is chosen; `p95` is never blended into
 throughput — the catalog's `throughput_last_1h.p50` is the fast tail.
 
+## Session affinity and the Vercel pin
+
+Two independent clocks decide whether a session keeps its provider:
+
+| Clock | Where | Default | Effect |
+|---|---|---|---|
+| gateway pin | Vercel AI Gateway (`sessionAffinity: true`) | 5 minutes since the session's last request | the gateway *prefers* the same upstream and keeps its prompt cache warm |
+| our lock | `sessions.json`, `session_ttl_s` | 21600 s — an **idle** TTL, refreshed by every request that uses the pin | which provider *we* propose first in `order` |
+
+The two are not the same value on purpose. The pin is what saves money (cache
+hits); it is only alive for 5 minutes after the last request. The lock is our
+memory of "which provider did this session use", so it must outlive the pin —
+otherwise every request after a 5-minute gap would be re-ranked and could move
+to a different upstream even though Vercel was still pinning us.
+
+Keep `session_ttl_s` **≥** the pin window. With `session_ttl_s` at or below the
+5-minute pin the ranking can move away from an upstream the gateway is still
+pinning, which loses the cache and (briefly) splits the session over two
+providers. Shorter values are only useful for debugging. Setting it to `0`
+disables the memory (every request is re-ranked, the pin still applies inside
+Vercel's window).
+
+## gwroute differences
+
+`gwroute.py` is a **dev-only** explorer (it is not imported by the plugin). Its
+`Workload.apply()` predates the hardened `planning._score()` and disagrees with it
+in these places — never copy a number from `gwroute.py` into a rule:
+
+| # | Behaviour | `gwroute.py` | `planning._score()` |
+|---|---|---|---|
+| 1 | default time value | `0.5 ¢/s` | `0.15 ¢/s` (`time_value_cents_per_s`) |
+| 2 | missing `pricing.prompt`/`completion` | `0.0` → looks **free**, wins | provider is **dropped** (`None`) |
+| 3 | missing cache price | falls back to `prompt` | falls back to `prompt` (same) |
+| 4 | missing latency | `0 s` → looks infinitely fast | peer median × `missing_metric_penalty` |
+| 5 | missing throughput | `0 s` → looks infinitely fast | peer median ÷ `missing_metric_penalty` |
+| 6 | `implicit-caching` tag | ignored, cache always credited | no tag → `cached_ratio` forced to 0 |
+| 7 | measured uptime 0 % | `risk = 1.0` (neutral) | `risk = 100.0` (worst case) |
+| 8 | NaN uptime | `risk = 1.0` | `risk = 100.0` |
+| 9 | unknown uptime | `risk = 1.0` | `risk = 1.0` (same) |
+| 10 | uptime blend | 0.5/0.3/0.2 over available windows | same |
+| 11 | context shrink reference | `Workload.model_ctx` (default: none) | max context over the live pool |
+| 12 | `has` output | never produced | `["quantization:fp8"]` etc. |
+| 13 | hard filters / fallback | `min_uptime`, `quant`, `tools` filters, no second pass | hard filters, then only `min_uptime`/`min_context` relaxed |
+| 14 | quarantine | none | `(model, provider)` demotion is respected |
+| 15 | sticky provider | `sticky=` / `crossover()` helper | session lock (`sessions.json`) |
+
 ## Environment variables
 
 | Variable | Default | Effect |
@@ -109,7 +160,7 @@ throughput — the catalog's `throughput_last_1h.p50` is the fast tail.
 | `HERMES_AI_GATEWAY_RULES` | – | alternative `rules.json` path |
 | `HERMES_AI_GATEWAY_RULES_SOURCE` | `<repo>/rules.json` | source file `deploy.sh` copies |
 | `HERMES_AI_GATEWAY_STATS_TTL` | 600 | stats TTL used by `infer_provider` |
-| `HERMES_AI_GATEWAY_LOG_UTC` | – | `collect_desktop.py`: log timestamps are UTC |
+| `HERMES_AI_GATEWAY_LOG_UTC` | auto-detect | forces `collect_desktop.py` to read log timestamps as UTC (`1`) or local (`0`) instead of detecting |
 | `AI_GATEWAY_API_KEY` | – | the gateway key (env or `$HERMES_HOME/.env`) |
 
 ## State files
@@ -144,6 +195,10 @@ python3 collect_desktop.py --all       # every session
 python3 collect_desktop.py --coverage  # coverage report, collects nothing
 python3 collect_desktop.py --retry-missing
 ```
+
+The log's timezone is detected at start-up by comparing the newest line with the
+clock (this host writes UTC, so the reading is identical); `agent.log` is read in
+the host's local time and `HERMES_AI_GATEWAY_LOG_UTC=1|0` overrides the detection.
 
 Run it every 10 minutes (systemd timer or cron), not as a daemon. Cost: one
 `/v1/generation` call per new desktop generation, i.e. roughly one request per

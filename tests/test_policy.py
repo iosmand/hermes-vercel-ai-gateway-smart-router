@@ -2,108 +2,135 @@
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
-"""Politika doğrulama testleri — sentetik sağlayıcılarla seçim kurallarını sınar.
+"""Policy tests for the production ranking: ``planning.rank()``.
 
-Çalıştır: python3 tests/test_policy.py   (veya depo kökünden python3 -m tests.test_policy)
+Every case is a synthetic catalog plus a rule — no network, no state, no API key.
+Run with ``python3 tests/test_policy.py`` or through ``tests/run_all.sh``.
 """
-import os
+import importlib.util
 import sys
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from gwroute import EP, Workload, crossover, select, table
-
-
-def ep(prov, in1m, out1m, tps, ttft_ms, up=100.0, quant="fp8", tools=True, status=0):
-    return EP(provider=prov, quant=quant, p_in=in1m / 1e6, p_out=out1m / 1e6, p_cache=in1m / 1e6 / 4,
-              tps=tps, ttft_ms=ttft_ms, up15=up, up1h=up, up1d=up,
-              status=status, tools=tools, ctx=1_000_000, zdr=True, tags=["tool-use"])
+REPO = Path(__file__).resolve().parents[1]
+FAILS: list[str] = []
 
 
-def run(name, eps, wl, expect, **kw):
-    res = select(eps, wl, quant="fp8", require_tools=True, **kw)
-    got = res["chosen"].provider
-    ok = got == expect
-    print(f"[{'PASS' if ok else 'FAIL'}] {name}: seçim={got} beklenen={expect} ({res['note']})")
-    if not ok:
-        print(table(res["ranked"], wl))
-    return ok
+def _load_planning():
+    spec = importlib.util.spec_from_file_location("gw_planning_policy",
+                                                  REPO / "plugin" / "planning.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-WL = Workload(input_tokens=8000, output_tokens=1200, time_value_cents_per_s=0.5)
+planning = _load_planning()
 
-results = []
+BASE_RULE = {
+    "precision": {"mode": "strict", "require": "fp8"},
+    "workload": {"input_tokens": 8000, "output_tokens": 1200, "cached_ratio": 0.0},
+    "time_value_cents_per_s": 0.15,
+    "require_tools": True,
+    "max_candidates": 4,
+    "session_affinity": False,
+}
 
-# 1) Kullanıcının örneği: en ucuz 30 tps, ikinci 60 tps, fiyat farkı küçük → hızlı olan kazanmalı
-results.append(run("ucuz+yavaş vs pahalı+hızlı (küçük fark)",
-    [ep("cheap-slow", 1.00, 3.00, 30, 800),
-     ep("fast", 1.05, 3.15, 60, 800)],
-    WL, "fast"))
 
-# 2) Kullanıcı kuralı: fark ~2.3¢ ve hızlı olan 2× tps → hızlı olan tercih edilmeli
-results.append(run("~2.3¢ fark + 2× tps → hızlı",
-    [ep("cheap-slow", 1.00, 3.00, 30, 800),
-     ep("fast", 3.00, 9.00, 60, 800)],
-    Workload(8000, 1200, 0.0, 0.5), "fast"))
+def ep(name, *, pin_cents=0.30, pout_cents=1.50, tps: float | None = 60,
+       ttft_ms: float | None = 800, uptime: float | None = 100.0,
+       quant="fp8", tools=True, cache_cents=None, ctx=10 ** 6, status=0):
+    pricing = {"prompt": pin_cents / 100 / 1e6, "completion": pout_cents / 100 / 1e6}
+    if cache_cents is not None:
+        pricing["input_cache_read"] = cache_cents / 100 / 1e6
+    tags = ["structured-output", "implicit-caching"] + (["tool-use"] if tools else [])
+    return {"provider_name": name, "quantization": quant, "status": status,
+            "pricing": pricing,
+            "uptime_last_15m": uptime, "uptime_last_1h": uptime, "uptime_last_1d": uptime,
+            "throughput_last_1h": {"p50": tps} if tps is not None else {},
+            "latency_last_1h": {"p50": ttft_ms} if ttft_ms is not None else {},
+            "tags": tags, "context_length": ctx}
 
-# 2b) Aynı çift, zaman değeri sıfıra yakın → ucuz olan kazanmalı (monoton geçiş)
-results.append(run("aynı çift, zaman değeri ≈0 → ucuz",
-    [ep("cheap-slow", 1.00, 3.00, 30, 800),
-     ep("fast", 3.00, 9.00, 60, 800)],
-    Workload(8000, 1200, 0.0, 0.001), "cheap-slow"))
 
-# 2c) Denge noktası gerçekten arada bir yerde olmalı
-_e1, _e2 = ep("cheap-slow", 1.00, 3.00, 30, 800), ep("fast", 3.00, 9.00, 60, 800)
-_w = Workload(8000, 1200, 0.0, 0.5)
-_w.apply(_e1); _w.apply(_e2)
-_tv = crossover(_e1, _e2)
-_ok = _tv is not None and 0.001 < _tv < 0.5
-print(f"[{'PASS' if _ok else 'FAIL'}] denge zaman-değeri 0.001 < {_tv:.4f} ¢/sn < 0.5")
-results.append(_ok)
+def order(eps, **rule):
+    ranked = planning.rank("test/model", {**BASE_RULE, **rule}, eps, {})
+    return [r["provider"] for r in ranked]
 
-# 3) Uptime cezası: %70 uptime'lı ucuz sağlayıcı, sağlıklı olana kaybetmeli
-results.append(run("uptime cezası",
-    [ep("flaky", 0.90, 2.70, 60, 800, up=70.0),
-     ep("healthy", 1.00, 3.00, 55, 850, up=100.0)],
-    WL, "healthy"))
 
-# 4) 15 dakikalık uptime çöküşü anında filtre devreye girmeli
-results.append(run("min_uptime filtresi",
-    [ep("degraded", 0.80, 2.40, 60, 800, up=88.0),
-     ep("healthy", 1.00, 3.00, 55, 850, up=100.0)],
-    WL, "healthy", min_uptime=95.0))
+def check(name, cond, detail=""):
+    print(f"[{'PASS' if cond else 'FAIL'}] {name} {detail}")
+    if not cond:
+        FAILS.append(name)
 
-# 5) Aynı fiyat + aynı hız ama biri FP4 → quant filtresi FP4'ü elemeli
-results.append(run("quant filtresi (fp4 elenir)",
-    [ep("fp4-prov", 0.70, 2.10, 90, 600, quant="fp4"),
-     ep("fp8-prov", 1.00, 3.00, 55, 850)],
-    WL, "fp8-prov"))
 
-# 6) Sticky: mevcut sağlayıcı %5 marj içindeyse korunmalı
-eps6 = [ep("incumbent", 1.00, 3.00, 55, 850),
-        ep("slightly-better", 0.98, 2.94, 58, 840)]
-results.append(run("sticky korunur (marj %5)",
-    eps6, WL, "incumbent", sticky="incumbent", sticky_margin_pct=5.0))
+def main() -> int:
+    # 1) a small price gap loses against the time value: fast beats cheap-but-slow
+    got = order([ep("cheap-slow", pin_cents=0.30, tps=30),
+                 ep("fast", pin_cents=0.60, tps=90)])
+    check("zaman değeri küçük fiyat farkını yener (hızlı önde)", got[0] == "fast", str(got))
 
-# 7) Sticky marjı aşılırsa bırakılmalı
-eps7 = [ep("incumbent", 2.50, 7.50, 30, 1500),
-        ep("much-better", 1.00, 3.00, 60, 700)]
-results.append(run("sticky bırakılır (marj aşıldı)",
-    eps7, WL, "much-better", sticky="incumbent", sticky_margin_pct=5.0))
+    # 2) a large price gap keeps the cheap provider on top: 10× the price buys
+    #    only 2.8 s, which is worth 0.42 ¢ at 0.15 ¢/s — the 2.5 ¢ gap wins.
+    got = order([ep("cheap", pin_cents=30.0, pout_cents=30.0, tps=100),
+                 ep("pricey-fast", pin_cents=300.0, pout_cents=300.0, tps=130)])
+    check("büyük fiyat farkı ucuzu korur", got[0] == "cheap", str(got))
 
-# 8) Zaman değeri 0 → saf maliyet optimizasyonu (en ucuz kazanır)
-results.append(run("zaman değeri 0 → en ucuz",
-    [ep("cheap-slow", 0.80, 2.40, 25, 1800),
-     ep("fast", 1.00, 3.00, 90, 600)],
-    Workload(8000, 1200, 0.0, 0.0), "cheap-slow"))
+    # 3) with zero time value money alone decides
+    got = order([ep("cheap-slow", pin_cents=0.30, tps=20),
+                 ep("fast", pin_cents=0.60, tps=200)],
+                time_value_cents_per_s=0.0)
+    check("zaman değeri 0 → en ucuz kazanır", got[0] == "cheap-slow", str(got))
 
-# 9) Cache oranı yüksekse cache fiyatı baskın olmalı
-eps9 = [ep("cache-friendly", 2.00, 4.00, 60, 700),
-        ep("no-cache", 1.20, 4.00, 60, 700)]
-eps9[0].p_cache = 0.05 / 1e6   # cache okuma neredeyse bedava
-eps9[1].p_cache = 1.20 / 1e6
-results.append(run("cache-ağırlıklı iş yükü",
-    eps9, Workload(20000, 1000, 0.85, 0.5), "cache-friendly"))
+    # 4) a failing provider is penalised (100% vs 50% uptime, same price/speed)
+    got = order([ep("flaky", uptime=50.0), ep("solid", uptime=100.0)])
+    check("uptime düşük sağlayıcı geride kalır", got[0] == "solid", str(got))
 
-print(f"\n{sum(results)}/{len(results)} test geçti")
-raise SystemExit(0 if all(results) else 1)
+    # 5) the uptime floor is a hard filter
+    got = order([ep("flaky", uptime=80.0), ep("solid", uptime=100.0)],
+                min_uptime_15m=90)
+    check("min_uptime_15m zayıf sağlayıcıyı eler", got == ["solid"], str(got))
+
+    # 6) strict precision excludes fp4 even when it is cheapest and fastest
+    got = order([ep("fp4-cheap", pin_cents=0.01, quant="fp4", tps=200),
+                 ep("fp8", pin_cents=0.30)])
+    check("strict precision fp4'ü eler", got == ["fp8"], str(got))
+
+    # 7) a provider without metrics loses to a measured one at the same price
+    got = order([ep("measured", pin_cents=0.30, tps=60),
+                 ep("unmeasured", pin_cents=0.30, tps=None, ttft_ms=None)])
+    check("ölçüsüz sağlayıcı ölçülüye kaybeder", got[0] == "measured", str(got))
+
+    # 8) require_tools is a hard filter
+    got = order([ep("no-tools", pin_cents=0.01, tools=False), ep("tools", pin_cents=0.30)],
+                require_tools=True)
+    check("require_tools araçsızı eler", got == ["tools"], str(got))
+
+    # 9) a cache-heavy workload prefers the cheaper cache price
+    eps = [ep("no-cache-price", pin_cents=0.30, cache_cents=0.30),
+           ep("cache-cheap", pin_cents=0.30, cache_cents=0.03)]
+    got = order(eps, workload={"input_tokens": 8000, "output_tokens": 100,
+                               "cached_ratio": 0.9})
+    check("cache ağırlıklı iş yükü cache fiyatını ödüllendirir", got[0] == "cache-cheap", str(got))
+
+    # 10) a provider without pricing is dropped instead of scoring as free
+    no_price = {"provider_name": "free-looking", "quantization": "fp8", "status": 0,
+                "pricing": {}, "uptime_last_15m": 100, "uptime_last_1h": 100,
+                "uptime_last_1d": 100, "throughput_last_1h": {"p50": 60},
+                "latency_last_1h": {"p50": 800}, "tags": ["tool-use"],
+                "context_length": 10 ** 6}
+    got = order([no_price, ep("priced", pin_cents=5.0)])
+    check("fiyatsız sağlayıcı elenir (bedava sayılmaz)", got == ["priced"], str(got))
+
+    # 11) unknown uptime is neutral (risk 1.0) — the provider stays a candidate
+    got = order([ep("unknown-up", uptime=None), ep("solid", uptime=100.0)])
+    check("uptime bilinmiyorsa nötr (aday kalır)", "unknown-up" in got, str(got))
+
+    print()
+    if FAILS:
+        print(f"{len(FAILS)} test BAŞARISIZ: {', '.join(FAILS)}")
+        return 1
+    print(f"{11}/{11} test geçti")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

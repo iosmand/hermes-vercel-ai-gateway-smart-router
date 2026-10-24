@@ -58,6 +58,20 @@ Review fixes.
   idempotent missing rows, partial trailing lines never consumed.
 - Log timestamps are local time (`HERMES_AI_GATEWAY_LOG_UTC=1` for UTC logs).
 
+### Owner decisions (review follow-up)
+
+- **F1d:** when every provider of a model is quarantined, only `has` is sent
+  (precision keeps being enforced), `order`/`only` are omitted and one WARNING per
+  model per minute is logged. Ranking returns when a quarantine expires.
+- **F1e:** no relaxed retry — the `no_capable_providers_available` 400 is logged
+  as a routing-config warning and nothing else changes.
+- **F6g:** the log timezone is detected by comparing the newest `agent.log` line
+  with the clock instead of assuming local time; `HERMES_AI_GATEWAY_LOG_UTC`
+  remains an explicit override.
+- **Session affinity:** the lock's idle TTL is now the rule key `session_ttl_s`
+  (default 21600 s) and is documented against the gateway's 5-minute pin.
+- **License holder:** "Osman Dağdeviren" in `pyproject.toml` and `plugin.yaml`.
+
 ### Packaging
 
 - MPL-2.0 license and headers, `pyproject.toml`, `CONTRIBUTING.md`,
@@ -65,6 +79,14 @@ Review fixes.
 - `deploy.sh`: backups, argument validation, JSON validation, byte-compilation,
   verification in a throwaway `HERMES_HOME`.
 - `tests/run_all.sh` runs every offline test.
+
+### Tests and tooling
+
+- `tests/test_policy.py` now exercises the production path (`planning.rank()`)
+  instead of the dev script; 11 cases including missing-price, missing-metrics,
+  cache-heavy and `require_tools` behaviour.
+- `gwroute.py` is marked dev-only in its header and its divergences from
+  `planning._score()` are listed in `README.md`.
 
 ## 1.0.0
 
