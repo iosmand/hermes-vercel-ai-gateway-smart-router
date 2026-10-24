@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -212,11 +213,19 @@ def _num(value) -> float | None:
 
 def _uptime(e: dict) -> float | None:
     parts = [(e.get("uptime_last_15m"), 0.5), (e.get("uptime_last_1h"), 0.3), (e.get("uptime_last_1d"), 0.2)]
-    have = [(float(v), w) for v, w in parts if v is not None]
+    have = [(v, w) for v, w in ((_num(v), w) for v, w in parts) if v is not None]
     if not have:
         return None
     tw = sum(w for _, w in have)
     return sum(v * w for v, w in have) / tw
+
+
+def _median(values: list[float]) -> float | None:
+    vals = sorted(v for v in values if v is not None and math.isfinite(v) and v > 0)
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2.0
 
 
 DEFAULT_PRECISION_POLICY = {
@@ -259,8 +268,12 @@ def _quality(e: dict, model_ctx: int | None, cfg: dict, precision_known: bool = 
     return max(q, 0.5)
 
 
+DEFAULT_MISSING_METRIC_PENALTY = 2.0
+
+
 def _score(e: dict, wl: dict, tv: float, quality_cfg: dict | None = None,
-           model_ctx: int | None = None, precision_known: bool = False) -> float | None:
+           model_ctx: int | None = None, precision_known: bool = False,
+           metrics: dict | None = None) -> float | None:
     pr = e.get("pricing") or {}
     p_in, p_out = _num(pr.get("prompt")), _num(pr.get("completion"))
     if p_in is None or p_out is None:
@@ -274,17 +287,47 @@ def _score(e: dict, wl: dict, tv: float, quality_cfg: dict | None = None,
         ratio = 0.0
     cached = n_in * ratio
     cost = (n_in - cached) * p_in + cached * p_cache + n_out * p_out
+
+    # F2a: a missing or non-positive metric must not look like "no waiting".
+    # The peer median is the estimate; the penalty makes it pessimistic
+    # (slower latency and lower throughput both mean more seconds).
+    metrics = metrics or {}
+    pen = float(metrics.get("penalty") or DEFAULT_MISSING_METRIC_PENALTY)
+    if pen <= 1.0:
+        pen = DEFAULT_MISSING_METRIC_PENALTY
+    lat = _num((e.get("latency_last_1h") or {}).get("p50"))
+    tps = _num((e.get("throughput_last_1h") or {}).get("p50"))
+    if lat is None or lat <= 0 or not math.isfinite(lat):
+        lat = (metrics.get("lat") or 0.0) * pen
+    if tps is None or tps <= 0 or not math.isfinite(tps):
+        med_tps = metrics.get("tps") or 0.0
+        tps = (med_tps / pen) if med_tps else 0.0
     secs = 0.0
-    lat = (e.get("latency_last_1h") or {}).get("p50")
-    tps = (e.get("throughput_last_1h") or {}).get("p50")
     if lat:
         secs += float(lat) / 1000.0
     if tps:
         secs += n_out / float(tps)
+
+    # F2b: unknown uptime stays neutral (risk 1.0); a measured 0% or NaN uptime is
+    # the worst case and must never beat a healthy provider.
     up = _uptime(e)
-    risk = (100.0 / up) if up and up > 0 else 1.0
+    if up is None:
+        risk = 1.0
+    elif not math.isfinite(up) or up <= 0:
+        risk = 100.0
+    else:
+        risk = 100.0 / up
     q = _quality(e, model_ctx, quality_cfg or DEFAULT_QUALITY, precision_known)
     return (cost * 100.0 + tv * secs) * risk / q
+
+
+def _status_num(e: dict) -> int:
+    """Numeric endpoint status; unknown/garbage is treated as 'not live' (-1)."""
+    try:
+        raw = e.get("status")
+        return int(raw) if raw not in (None, "") else 0
+    except (TypeError, ValueError, AttributeError):
+        return -1
 
 
 def resolve_precision(rule: dict, endpoints: list[dict]) -> dict:
@@ -305,7 +348,7 @@ def resolve_precision(rule: dict, endpoints: list[dict]) -> dict:
                 "keep_unknown": mode != "strict" or bool(prec.get("allow_unknown")),
                 "source": "explicit"}
 
-    live = [e for e in endpoints if int(e.get("status") or 0) == 0]
+    live = [e for e in endpoints if isinstance(e, dict) and _status_num(e) == 0]
     if not live:
         return {"mode": "any", "require": None, "exclude": (), "keep_unknown": True,
                 "source": "auto:aday-yok"}
@@ -344,40 +387,71 @@ def rank(model: str, rule: dict, endpoints: list[dict], demoted: dict) -> list[d
     min_up = rule.get("min_uptime_15m")
     min_ctx = rule.get("min_context")
     need_tools = rule.get("require_tools", True)
+    require_metrics = bool(rule.get("require_metrics", False))
     wl = rule.get("workload") or {}
     tv = float(rule.get("time_value_cents_per_s", 0.15))
     quality_cfg = {**DEFAULT_QUALITY, **(rule.get("quality") or {})}
-    model_ctx = rule.get("model_context") or max(
-        (int(e.get("context_length") or 0) for e in endpoints), default=0) or None
+
+    def _ctx_of(e) -> int:
+        try:
+            return int(e.get("context_length") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    model_ctx = rule.get("model_context") or max((_ctx_of(e) for e in endpoints), default=0) or None
+
+    # F2a: peer medians are the estimate for providers that report no metrics.
+    metrics = {
+        "lat": _median([_num((e.get("latency_last_1h") or {}).get("p50")) or 0.0 for e in endpoints]),
+        "tps": _median([_num((e.get("throughput_last_1h") or {}).get("p50")) or 0.0 for e in endpoints]),
+        "penalty": float(rule.get("missing_metric_penalty") or DEFAULT_MISSING_METRIC_PENALTY),
+    }
 
     now = time.time()
 
     def collect(up_floor, ctx_floor) -> list[dict]:
         picked: list[dict] = []
         for e in endpoints:
-            if int(e.get("status") or 0) != 0:
-                continue
-            quant = e.get("quantization") or None
-            if mode == "strict" and require:
-                if quant != require and not (quant is None and keep_unknown):
+            try:
+                if not isinstance(e, dict):
+                    raise TypeError(f"endpoint is {type(e).__name__}, not dict")
+                # F2c: comparison only fails on weird input, but do not trust it
+                # with mixed types (a string status must not kill the model).
+                status = e.get("status")
+                status_n = int(status) if status not in (None, "") else 0
+                if status_n != 0:
                     continue
-            elif mode == "exclude" and quant in exclude:
-                continue
-            if need_tools and "tool-use" not in (e.get("tags") or []):
-                continue
-            if up_floor is not None and (_uptime(e) or 0) < float(up_floor):
-                continue
-            if ctx_floor and (e.get("context_length") or 0) < int(ctx_floor):
-                continue
-            prov = e.get("provider_name")
-            penalty_until = (demoted.get(prov) or {}).get("until", 0)
-            if penalty_until and penalty_until > now:
-                continue
-            score = _score(e, wl, tv, quality_cfg, model_ctx, precision_known)
-            if score is None:
-                continue
-            picked.append({"provider": prov, "score": score,
-                           "quality": round(_quality(e, model_ctx, quality_cfg), 3)})
+                # F2d: quantization is matched case-insensitively.
+                quant = (e.get("quantization") or "").strip().lower() or None
+                if mode == "strict" and require:
+                    if quant != (require or "").lower() and not (quant is None and keep_unknown):
+                        continue
+                elif mode == "exclude" and quant in {str(x).lower() for x in exclude}:
+                    continue
+                if need_tools and "tool-use" not in (e.get("tags") or []):
+                    continue
+                lat_raw = _num((e.get("latency_last_1h") or {}).get("p50"))
+                tps_raw = _num((e.get("throughput_last_1h") or {}).get("p50"))
+                if require_metrics and not ((lat_raw and lat_raw > 0) and (tps_raw and tps_raw > 0)):
+                    continue
+                up = _uptime(e)
+                if up_floor is not None:
+                    if up is None or not math.isfinite(up) or up <= 0 or up < float(up_floor):
+                        continue
+                if ctx_floor and _ctx_of(e) < int(ctx_floor):
+                    continue
+                prov = e.get("provider_name")
+                penalty_until = (demoted.get(prov) or {}).get("until", 0)
+                if penalty_until and penalty_until > now:
+                    continue
+                score = _score(e, wl, tv, quality_cfg, model_ctx, precision_known, metrics)
+                if score is None:
+                    continue
+                picked.append({"provider": prov, "score": score,
+                               "quality": round(_quality(e, model_ctx, quality_cfg), 3)})
+            except Exception as exc:
+                log.warning("ai-gateway-router: %s — skipping malformed endpoint %r: %s",
+                            model, (e or {}).get("provider_name"), exc)
         picked.sort(key=lambda x: x["score"])
         return picked
 
@@ -639,7 +713,7 @@ def build_gateway(model: str, session_key: str | None = None) -> dict:
         dem = demoted()
         ranked = rank(model, rule, endpoints, dem)
         if not ranked:
-            live = [e for e in endpoints if int(e.get("status") or 0) == 0]
+            live = [e for e in endpoints if isinstance(e, dict) and _status_num(e) == 0]
             if live and all(e.get("provider_name") in dem for e in live):
                 _warn_routing_once(
                     model, "ai-gateway-router: %s — every provider is quarantined; routing is OFF "
