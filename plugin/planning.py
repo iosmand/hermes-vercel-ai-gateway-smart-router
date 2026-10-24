@@ -17,6 +17,8 @@ Bu modül asla istisna fırlatmamalı: her hata yutulur, yönlendirme devre dı�
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import math
@@ -71,6 +73,10 @@ def home() -> Path:
 def state_dir() -> Path:
     d = home() / "ai-gateway-router"
     d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)      # ledger rows are billing data
+    except OSError:
+        pass
     return d
 
 
@@ -137,35 +143,126 @@ def _demoted_raw() -> dict:
     return _migrate_keys(_json_state("demoted.json"))
 
 
-def _save_state(name: str, data: dict) -> None:
+@contextlib.contextmanager
+def state_lock(timeout: float = 5.0):
+    """Cross-process lock for read-modify-write cycles on the state files."""
+    path = state_dir() / ".state.lock"
+    fh = path.open("a+")
     try:
-        p = state_dir() / name
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(p)
+        deadline = time.time() + timeout
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() > deadline:
+                    log.warning("ai-gateway-router: state.lock alınamadı (%.1fs) — "
+                                "kilitsiz devam ediliyor", timeout)
+                    break
+                time.sleep(0.02)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        fh.close()
+
+
+def _save_state(name: str, data: dict) -> None:
+    """Atomic write: unique temp file in the state dir, fsync, then os.replace."""
+    tmp = None
+    try:
+        d = state_dir()
+        fd, tmp = tempfile.mkstemp(dir=str(d), prefix="." + name + "-")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, d / name)
     except Exception as exc:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         log.debug("ai-gateway-router: %s yazılamadı: %s", name, exc)
 
 
 # ------------------------------------------------------------------ kurallar
+RULE_KEYS = {
+    "role", "precision", "precision_policy", "workload", "require_tools",
+    "require_metrics", "missing_metric_penalty", "min_uptime_15m", "min_context",
+    "model_context", "max_candidates", "time_value_cents_per_s",
+    "session_affinity", "stats_ttl_s", "quality",
+}
+PRECISION_MODES = {"auto", "strict", "exclude", "any"}
+_VALIDATED_MTIME: dict[str, float] = {}
+
+
+def validate_rules(data: dict) -> list[str]:
+    """Return human-readable problems; an empty list means the file is valid."""
+    problems: list[str] = []
+    models = data.get("models")
+    if not isinstance(models, dict):
+        return ["models: bir nesne (object) olmalı"]
+    for name, rule in models.items():
+        if not isinstance(rule, dict):
+            problems.append(f"models[{name}]: nesne olmalı")
+            continue
+        for key in sorted(set(rule) - RULE_KEYS):
+            problems.append(f"models[{name}].{key}: bilinmeyen anahtar")
+        prec = rule.get("precision")
+        if prec is not None:
+            if not isinstance(prec, dict):
+                problems.append(f"models[{name}].precision: nesne olmalı")
+            elif prec.get("mode", "auto") not in PRECISION_MODES:
+                problems.append(f"models[{name}].precision.mode: "
+                                f"{prec.get('mode')!r} geçersiz ({sorted(PRECISION_MODES)})")
+        wl = rule.get("workload")
+        if wl is not None and not isinstance(wl, dict):
+            problems.append(f"models[{name}].workload: nesne olmalı")
+        for key in ("require_tools", "require_metrics", "session_affinity"):
+            if key in rule and not isinstance(rule[key], bool):
+                problems.append(f"models[{name}].{key}: bool olmalı")
+        for key in ("min_uptime_15m", "min_context", "max_candidates",
+                    "time_value_cents_per_s", "stats_ttl_s",
+                    "missing_metric_penalty", "model_context"):
+            if key in rule and rule[key] is not None:
+                try:
+                    float(rule[key])
+                except (TypeError, ValueError):
+                    problems.append(f"models[{name}].{key}: sayı olmalı")
+    return problems
+
+
 def load_rules() -> dict:
     p = rules_path()
     if p is None:
         return {}
     try:
+        mtime = p.stat().st_mtime
         data = json.loads(p.read_text(encoding="utf-8"))
-        return data.get("models") or {}
     except Exception as exc:
         log.debug("ai-gateway-router: rules.json okunamadı: %s", exc)
         return {}
+    key = str(p)
+    if _VALIDATED_MTIME.get(key) != mtime:
+        _VALIDATED_MTIME[key] = mtime
+        for problem in validate_rules(data):
+            log.warning("ai-gateway-router: %s — %s", p.name, problem)
+    models = data.get("models")
+    return models if isinstance(models, dict) else {}
 
 
 def rule_for(model: str) -> dict | None:
+    """Rule for this model; the optional "*" entry is the default for unlisted ones."""
     rules = load_rules()
     rule = rules.get(model)
     if rule is None:
-        return None
-    return rule
+        rule = rules.get("*")
+    return rule if isinstance(rule, dict) else None
 
 
 # --------------------------------------------------------------- istatistik
@@ -607,8 +704,25 @@ def locked_provider(model: str, session_key: str) -> str | None:
     return rec.get("provider")
 
 
+def touch_provider(model: str, session_key: str, provider: str, min_age: float = 60.0) -> None:
+    """Refresh the lock timestamp (idle TTL): a session that keeps talking keeps
+    its provider; only a session idle for DEFAULT_SESSION_TTL loses it."""
+    if not session_key:
+        return
+    with _LOCK, state_lock():
+        state = _sessions()
+        rec = state.get(session_key) or {}
+        if rec.get("model") != model or rec.get("provider") != provider:
+            return
+        if time.time() - float(rec.get("ts") or 0) < min_age:
+            return
+        rec["ts"] = time.time()
+        state[session_key] = rec
+        _save_state("sessions.json", state)
+
+
 def lock_provider(model: str, session_key: str, provider: str) -> None:
-    with _LOCK:
+    with _LOCK, state_lock():
         state = _sessions()
         state[session_key] = {"model": model, "provider": provider, "ts": time.time()}
         now = time.time()
@@ -617,7 +731,7 @@ def lock_provider(model: str, session_key: str, provider: str) -> None:
 
 
 def release_provider(session_key: str) -> None:
-    with _LOCK:
+    with _LOCK, state_lock():
         state = _sessions()
         if session_key in state:
             state.pop(session_key, None)
@@ -664,7 +778,7 @@ def record_strike(model: str, session_key: str | None, provider: str | None, rea
     """
     if not provider:
         return None
-    with _LOCK:
+    with _LOCK, state_lock():
         now = time.time()
         pause = _json_state("strike_pause.json")
         if float(pause.get("until") or 0) > now:
@@ -890,6 +1004,7 @@ def build_gateway(model: str, session_key: str | None = None) -> dict:
             pinned = locked_provider(model, session_key)
             if pinned and pinned in order:
                 order = [pinned] + [p for p in order if p != pinned]
+                touch_provider(model, session_key, pinned)
             elif pinned:
                 release_provider(session_key)
                 pinned = None

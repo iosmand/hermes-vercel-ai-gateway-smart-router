@@ -15,11 +15,18 @@ import sys
 import time
 import urllib.request
 
-import yaml
-
 from gwroute import (BASE, EP, Workload, api_key, crossover, load, select, table)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _yaml():
+    """PyYAML is only needed for router.yaml input, not for --check-rules."""
+    try:
+        import yaml
+    except ImportError:
+        sys.exit("PyYAML gerekli: python3 -m pip install pyyaml")
+    return yaml
 
 
 def merge(defaults: dict, model_cfg: dict) -> dict:
@@ -34,7 +41,7 @@ def merge(defaults: dict, model_cfg: dict) -> dict:
 
 def export_rules(cfg_path: str, out_path: str) -> dict:
     """router.yaml → rules.json (plugin'in çalışma zamanında okuduğu dosya)."""
-    cfg = yaml.safe_load(open(cfg_path, encoding="utf-8"))
+    cfg = _yaml().safe_load(open(cfg_path, encoding="utf-8"))
     defaults = cfg.get("defaults") or {}
     models = {}
     for model, mcfg in (cfg.get("models") or {}).items():
@@ -60,7 +67,7 @@ def export_rules(cfg_path: str, out_path: str) -> dict:
 
 
 def build(cfg_path: str) -> dict:
-    cfg = yaml.safe_load(open(cfg_path, encoding="utf-8"))
+    cfg = _yaml().safe_load(open(cfg_path, encoding="utf-8"))
     defaults = cfg.get("defaults") or {}
     plans = {}
     for model, mcfg in (cfg.get("models") or {}).items():
@@ -153,17 +160,59 @@ def live(model: str, plan: dict, max_tokens: int = 400) -> None:
               f"cost=${r['cost_usd']} karakter={r['chars']}")
 
 
+def _planning_module():
+    """Load the plugin's planning module for rule validation."""
+    import importlib.util
+    path = os.path.join(HERE, "plugin", "planning.py")
+    spec = importlib.util.spec_from_file_location("ai_gateway_router_planning_cli", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def check_rules(path: str | None = None) -> int:
+    """Validate a rules.json file; exit 1 (and list problems) when it is invalid."""
+    if not path:
+        home = os.environ.get("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
+        path = os.path.join(home, "ai-gateway-router", "rules.json")
+    if not os.path.isfile(path):
+        print(f"yok: {path}")
+        return 1
+    try:
+        data = json.loads(open(path, encoding="utf-8").read())
+    except ValueError as exc:
+        print(f"geçersiz JSON: {exc}")
+        return 1
+    problems = _planning_module().validate_rules(data)
+    if problems:
+        print(f"{path}: {len(problems)} sorun")
+        for p in problems:
+            print("  -", p)
+        return 1
+    models = data.get("models") or {}
+    print(f"{path}: geçerli ({len(models)} model kuralı)")
+    return 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=os.path.join(HERE, "router.yaml"))
     ap.add_argument("--model", default=None)
     ap.add_argument("--write", default=None)
+    ap.add_argument("--force", action="store_true",
+                    help="mevcut rules.json'u --write sırasında ez")
+    ap.add_argument("--check-rules", dest="check_rules", nargs="?", const="",
+                    default=None, metavar="RULES_JSON",
+                    help="rules.json doğrula ve çık (yol verilmezse $HERMES_HOME/ai-gateway-router/rules.json)")
     ap.add_argument("--live", default=None)
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
 
+    if a.check_rules is not None:
+        sys.exit(check_rules(a.check_rules))
+
     if a.live:
-        cfg = yaml.safe_load(open(a.config, encoding="utf-8"))
+        cfg = _yaml().safe_load(open(a.config, encoding="utf-8"))
         c = merge(cfg.get("defaults") or {}, (cfg.get("models") or {}).get(a.live) or {})
         plans = build(a.config)
         live(a.live, plans[a.live])
@@ -173,8 +222,10 @@ def main() -> None:
     if a.model:
         plans = {a.model: plans[a.model]} if a.model in plans else sys.exit(f"yok: {a.model}")
     if a.write:
-        json.dump(plans, open(a.write, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
         rules_out = os.path.join(os.path.dirname(os.path.abspath(a.write)), "rules.json")
+        if os.path.exists(rules_out) and not a.force:
+            sys.exit(f"{rules_out} zaten var — ezmek için --force kullanın")
+        json.dump(plans, open(a.write, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
         export_rules(a.config, rules_out)
         print("yazıldı:", a.write, "+", os.path.basename(rules_out))
     if a.json:
