@@ -1,4 +1,4 @@
-# AI Gateway Router
+# hermes-vercel-ai-gateway-smart-router
 
 Hermes için Vercel AI Gateway sağlayıcı seçim eklentisi. Model başına çalışma
 kuralını (`rules.json`) canlı endpoint istatistikleriyle birleştirir; maliyet,
@@ -23,7 +23,7 @@ gecikme, uptime, precision ve kalite sinyallerine göre
 
    ```bash
    export HERMES_HOME="$HOME/.hermes"
-   cd ai-gateway-router
+   cd hermes-vercel-ai-gateway-smart-router
    ```
 
 2. Kendi model kurallarınızı oluşturun. Örnek dosya gerçek kullanıcı verisi,
