@@ -251,6 +251,17 @@ class AIGatewayRouterProfile(_BaseProfile):
             body = _full_body(error, body)                 # B1: tam gövde (SDK inner'ı tamamlar)
             failed = _failed_providers(body)               # B1: routing + eski anahtarlar
             body_provider = failed[0] if failed else None
+
+            # F1e: 400 "no_capable_providers_available" = our own routing config is
+            # wrong (only/has contradiction), not a provider failure. Report it and
+            # never record a strike against a provider.
+            blob = f"{message or ''} {body if isinstance(body, str) else json.dumps(body or {})}"
+            if status_code == 400 and "no_capable_providers" in blob.lower():
+                log.warning("ai-gateway-router: routing config rejected for model=%s — gateway says "
+                            "no_capable_providers_available; check 'only'/'has' for this model "
+                            "(routing fell back to a plain request)", model)
+                return None
+
             provider_failure = status_code in (500, 502, 503, 504, 529) or (
                 error is not None and "timeout" in type(error).__name__.lower()
             )

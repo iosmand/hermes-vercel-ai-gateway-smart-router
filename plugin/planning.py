@@ -40,6 +40,17 @@ STRIKE_PAUSE_S = 300.0         # B3: küresel strike durdurma süresi
 
 _LOCK = threading.Lock()
 _REFRESHING: set[str] = set()
+_ROUTING_WARN_TS: dict[str, float] = {}
+
+
+def _warn_routing_once(model: str, msg: str, *args) -> None:
+    """Route-off warnings are rate limited: at most one per model per minute."""
+    now = time.time()
+    with _LOCK:
+        if now - float(_ROUTING_WARN_TS.get(model) or 0.0) < 60.0:
+            return
+        _ROUTING_WARN_TS[model] = now
+    log.warning(msg, *args)
 
 
 # ------------------------------------------------------------------ yollar
@@ -318,7 +329,12 @@ def resolve_precision(rule: dict, endpoints: list[dict]) -> dict:
 
 
 def rank(model: str, rule: dict, endpoints: list[dict], demoted: dict) -> list[dict]:
-    """Kuralları uygulayıp sağlayıcıları skora göre sıralar."""
+    """Apply the rule and rank providers by score.
+
+    Hard filters (precision, tool-use, quarantine) are never relaxed. The soft
+    floors (``min_uptime_15m``, ``min_context``) are dropped once, in a second
+    pass, only when the first pass leaves no candidate at all.
+    """
     rp = resolve_precision(rule, endpoints)
     mode, require = rp["mode"], rp["require"]
     exclude = set(rp["exclude"])
@@ -330,67 +346,74 @@ def rank(model: str, rule: dict, endpoints: list[dict], demoted: dict) -> list[d
     need_tools = rule.get("require_tools", True)
     wl = rule.get("workload") or {}
     tv = float(rule.get("time_value_cents_per_s", 0.15))
-    max_cand = int(rule.get("max_candidates", 4))
     quality_cfg = {**DEFAULT_QUALITY, **(rule.get("quality") or {})}
     model_ctx = rule.get("model_context") or max(
         (int(e.get("context_length") or 0) for e in endpoints), default=0) or None
 
     now = time.time()
-    out = []
-    for e in endpoints:
-        if int(e.get("status") or 0) != 0:
-            continue
-        quant = e.get("quantization") or None
-        if mode == "strict" and require:
-            if quant != require and not (quant is None and keep_unknown):
-                continue
-        elif mode == "exclude" and quant in exclude:
-            continue
-        if need_tools and "tool-use" not in (e.get("tags") or []):
-            continue
-        if min_up is not None and (_uptime(e) or 0) < float(min_up):
-            continue
-        if min_ctx and (e.get("context_length") or 0) < int(min_ctx):
-            continue
-        prov = e.get("provider_name")
-        penalty_until = (demoted.get(prov) or {}).get("until", 0)
-        if penalty_until and penalty_until > now:
-            continue
-        score = _score(e, wl, tv, quality_cfg, model_ctx, precision_known)
-        if score is None:
-            continue
-        out.append({"provider": prov, "score": score, "quality": round(_quality(e, model_ctx, quality_cfg), 3)})
 
-    out.sort(key=lambda x: x["score"])
-    if not out:  # filtreler her şeyi eledi → filtreyi gevşetip maliyete göre sırala
+    def collect(up_floor, ctx_floor) -> list[dict]:
+        picked: list[dict] = []
         for e in endpoints:
+            if int(e.get("status") or 0) != 0:
+                continue
+            quant = e.get("quantization") or None
+            if mode == "strict" and require:
+                if quant != require and not (quant is None and keep_unknown):
+                    continue
+            elif mode == "exclude" and quant in exclude:
+                continue
+            if need_tools and "tool-use" not in (e.get("tags") or []):
+                continue
+            if up_floor is not None and (_uptime(e) or 0) < float(up_floor):
+                continue
+            if ctx_floor and (e.get("context_length") or 0) < int(ctx_floor):
+                continue
             prov = e.get("provider_name")
-            if int(e.get("status") or 0) != 0 or prov in demoted:
+            penalty_until = (demoted.get(prov) or {}).get("until", 0)
+            if penalty_until and penalty_until > now:
                 continue
             score = _score(e, wl, tv, quality_cfg, model_ctx, precision_known)
-            if score is not None:
-                out.append({"provider": prov, "score": score,
-                            "quality": round(_quality(e, model_ctx, quality_cfg), 3)})
-        out.sort(key=lambda x: x["score"])
-    return out   # kesme build_gateway'de (only kümesi de buradan türetilir)
+            if score is None:
+                continue
+            picked.append({"provider": prov, "score": score,
+                           "quality": round(_quality(e, model_ctx, quality_cfg), 3)})
+        picked.sort(key=lambda x: x["score"])
+        return picked
+
+    out = collect(min_up, min_ctx)
+    if not out and (min_up is not None or min_ctx):
+        out = collect(None, None)
+        if out:
+            log.info("ai-gateway-router: %s — uptime/context floors relaxed "
+                     "(precision, tool-use and quarantine kept)", model)
+    return out   # the cut happens in build_gateway (the `only` set comes from here)
 
 
-def has_filter(rule: dict, endpoints: list[dict] | None = None) -> list[str]:
-    """Kuralın precision politikasını gateway `has` listesine çevirir.
+def has_server_filter(rule: dict, endpoints: list[dict] | None = None) -> list[str]:
+    """Translate the rule's precision policy into the gateway ``has`` list.
 
-    `mode: auto` ise politika canlı katalogdan türetilir (resolve_precision).
+    ``has`` must never contradict ``only``: in strict mode with
+    ``allow_unknown`` the pool deliberately keeps undeclared providers, and no
+    ``has`` expression can say "fp8 or unknown" — so no filter is sent and the
+    ``only`` list carries the policy.
     """
     if endpoints is not None:
         rp = resolve_precision(rule, endpoints)
     else:
         prec = rule.get("precision") or {}
         rp = {"mode": prec.get("mode", "auto"), "require": prec.get("require", "fp8"),
-              "exclude": tuple(prec.get("exclude") or ("fp4", "int4"))}
-    if rp.get("mode") == "strict" and rp.get("require"):
+              "exclude": tuple(prec.get("exclude") or ("fp4", "int4")),
+              "keep_unknown": prec.get("mode", "auto") != "strict" or bool(prec.get("allow_unknown"))}
+    if rp.get("mode") == "strict" and rp.get("require") and not rp.get("keep_unknown"):
         return [f"quantization:{rp['require']}"]
     if rp.get("mode") == "exclude":
         return [f"!quantization:{v}" for v in rp["exclude"]]
     return []
+
+
+# Backwards-compatible alias (pre-existing callers/tests use has_filter).
+has_filter = has_server_filter
 
 
 # ------------------------------------------------------------------ oturumlar
@@ -586,6 +609,23 @@ def record_truth(generation_id: str, intended: str | None, model: str) -> None:
     threading.Thread(target=_work, name="gw-truth", daemon=True).start()
 
 
+def _passes_has(e: dict, has: list[str]) -> bool:
+    """True when the endpoint satisfies every entry of a gateway ``has`` list."""
+    quant = (e.get("quantization") or "").lower()
+    for item in has:
+        neg = item.startswith("!")
+        token = item[1:] if neg else item
+        if ":" not in token:
+            return False
+        key, want = token.split(":", 1)
+        if key != "quantization":
+            return False
+        ok = quant == (want or "").lower()
+        if ok == neg:
+            return False
+    return True
+
+
 # ------------------------------------------------------------------ ana giriş
 def build_gateway(model: str, session_key: str | None = None) -> dict:
     """Model için gateway bloğu: {order, has, sessionId, sessionAffinity}."""
@@ -596,8 +636,18 @@ def build_gateway(model: str, session_key: str | None = None) -> dict:
         endpoints, stale = stats(model, float(rule.get("stats_ttl_s", DEFAULT_STATS_TTL)))
         if not endpoints:
             return {}
-        ranked = rank(model, rule, endpoints, demoted())
+        dem = demoted()
+        ranked = rank(model, rule, endpoints, dem)
         if not ranked:
+            live = [e for e in endpoints if int(e.get("status") or 0) == 0]
+            if live and all(e.get("provider_name") in dem for e in live):
+                _warn_routing_once(
+                    model, "ai-gateway-router: %s — every provider is quarantined; routing is OFF "
+                           "for this model until a quarantine expires", model)
+            else:
+                _warn_routing_once(
+                    model, "ai-gateway-router: %s — no provider passes the rule filters "
+                           "(precision/tool-use/uptime/context); routing is OFF for this model", model)
             return {}
         max_cand = int(rule.get("max_candidates", 4))
         top = ranked[:max_cand] if max_cand else list(ranked)
@@ -606,6 +656,22 @@ def build_gateway(model: str, session_key: str | None = None) -> dict:
         if len(top) < 2:
             top = ranked[:2]
         order = [r["provider"] for r in top]
+
+        # `has` ve `only` çelişmemeli: sunucu tarafı filtrenin reddedeceği sağlayıcı
+        # `only` içinde kalırsa istek "no_capable_providers_available" ile düşer.
+        h = has_server_filter(rule, endpoints)
+        if h:
+            allowed = {e.get("provider_name") for e in endpoints if _passes_has(e, h)}
+            kept = [p for p in order if p in allowed]
+            if not kept:
+                _warn_routing_once(
+                    model, "ai-gateway-router: %s — has=%s excludes the whole only set; "
+                           "routing is OFF for this model", model, h)
+                return {}
+            if len(kept) != len(order):
+                log.info("ai-gateway-router: %s — %d provider(s) dropped from only: "
+                         "inconsistent with has=%s", model, len(order) - len(kept), h)
+            order = kept
 
         if session_key and rule.get("session_affinity", True):
             pinned = locked_provider(model, session_key)
@@ -622,7 +688,6 @@ def build_gateway(model: str, session_key: str | None = None) -> dict:
         gw = {"order": order, "only": list(order),
               "sessionAffinity": bool(rule.get("session_affinity", True))}
         LAST_GATEWAY[model] = {"order": list(order), "only": list(order)}
-        h = has_filter(rule, endpoints)
         if h:
             gw["has"] = h
         if stale:
