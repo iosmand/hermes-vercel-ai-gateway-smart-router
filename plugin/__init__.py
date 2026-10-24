@@ -33,15 +33,62 @@ from typing import Any
 from providers import get_provider_profile, register_provider
 from providers.base import ProviderProfile
 
-try:  # paket olarak yüklendiyse
-    from . import planning
-except Exception:  # düz modül olarak yüklendiyse
-    import sys as _sys
+def _load_planning():
+    """Import planning as a package submodule, else as a uniquely named module.
 
-    _here = str(Path(__file__).resolve().parent)
-    if _here not in _sys.path:
-        _sys.path.insert(0, _here)
-    import planning
+    No ``sys.path`` mutation: a top-level directory on sys.path can shadow an
+    unrelated module called ``planning``.
+    """
+    try:
+        from . import planning as _mod       # loaded as a package
+        return _mod
+    except Exception:
+        pass
+    import importlib.util
+    import sys
+    # Reuse an already-imported copy ONLY when it is this very file (keeps test
+    # doubles and any caller that patched planning working); never a stranger.
+    here = Path(__file__).with_name("planning.py").resolve()
+    cand = sys.modules.get("planning")
+    if cand is not None:
+        try:
+            if Path(getattr(cand, "__file__", "")).resolve() == here:
+                return cand
+        except Exception:
+            pass
+    name = "ai_gateway_router_planning"
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("planning.py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_TRANSPORT = None
+
+
+def _load_transport():
+    """Load transport.py once per process under a unique module name."""
+    global _TRANSPORT
+    if _TRANSPORT is not None:
+        return _TRANSPORT
+    import importlib.util
+    import sys
+    name = "ai_gateway_router_transport"
+    mod = sys.modules.get(name)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("transport.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+    _TRANSPORT = mod
+    return mod
+
+
+planning = _load_planning()
 
 log = logging.getLogger(__name__)
 
@@ -324,12 +371,16 @@ class AIGatewayRouterProfile(_BaseProfile):
         except Exception as exc:
             log.warning("ai-gateway-router: OpenAI istemcisi kurulamadı (%s) — standart yol", exc)
             return None
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "ai_gateway_router_transport", str(Path(__file__).with_name("transport.py")))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod.wrap_client(client)
+        try:
+            mod = _load_transport()
+        except Exception as exc:
+            log.warning("ai-gateway-router: transport yüklenemedi (%s) — standart istemci", exc)
+            return None
+        try:
+            return mod.wrap_client(client, planning=planning)
+        except Exception as exc:
+            log.warning("ai-gateway-router: istemci sarılamadı (%s) — standart istemci", exc)
+            return None
 
     def get_usage_cost(self, model: str, usage: Any) -> Any | None:
         """Gateway'in döndürdüğü gerçek maliyeti kullan (tahmin yerine fatura değeri)."""

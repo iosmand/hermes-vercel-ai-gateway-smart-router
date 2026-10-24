@@ -131,11 +131,12 @@ def ledger_enabled() -> bool:
 class _InstrumentedStream:
     """openai Stream sarmalayıcısı: chunk'ları aynen geçirir, ölçüm alır."""
 
-    def __init__(self, inner: Any, meta: dict, t0: float):
+    def __init__(self, inner: Any, meta: dict, t0: float, planning: Any = None):
         self._inner = inner
         self._it = iter(inner)
         self._meta = meta
         self._t0 = t0
+        self._planning = planning
         self._ttft_ms: float | None = None
         self._last_chunk: Any = None
         self._done = False
@@ -202,11 +203,25 @@ class _InstrumentedStream:
             row["provider_actual"] = resolved or row.get("provider_actual")
             # 3.1: stream — affinity alanları SON chunk'ın delta'sı üzerinden
             row.update(_affinity_fields(_routing_dict(delta)))
-        _after_request(row, self._meta)
+        _after_request(row, self._meta, self._planning)
 
 
-def _after_request(row: dict, meta: dict) -> None:
-    """2.4 ledger + 2.6 failover işleme (asla istisna fırlatmaz)."""
+_WARNED = {"failover": False, "post": False}
+
+
+def _warn_once(key: str, msg: str, *args) -> None:
+    if _WARNED.get(key):
+        return
+    _WARNED[key] = True
+    log.warning(msg, *args, exc_info=True)
+
+
+def _after_request(row: dict, meta: dict, planning: Any = None) -> None:
+    """2.4 ledger + 2.6 failover işleme (asla istisna fırlatmaz).
+
+    ``planning`` is injected by the plugin; this module never imports it, so a
+    package-style load cannot fail with ModuleNotFoundError.
+    """
     try:
         if ledger_enabled():
             write_ledger_row(row)
@@ -220,17 +235,21 @@ def _after_request(row: dict, meta: dict) -> None:
             log.warning("ai-gateway-router: failover model=%s intended=%s actual=%s",
                         model, intended, actual)
             if session_key and model and actual in only:
-                import planning
-                planning.lock_provider(model, session_key, actual)
-                log.warning("ai-gateway-router: kilit %s → %s taşındı (failover)",
-                            intended, actual)
-    except Exception as exc:
-        log.debug("ai-gateway-router: post-request işlenemedi: %s", exc)
+                if planning is None:
+                    _warn_once("failover", "ai-gateway-router: planning module not injected — "
+                                           "session lock NOT moved after failover")
+                else:
+                    planning.lock_provider(model, session_key, actual)
+                    log.warning("ai-gateway-router: kilit %s → %s taşındı (failover)",
+                                intended, actual)
+    except Exception:
+        _warn_once("post", "ai-gateway-router: post-request işlenemedi (tek seferlik uyarı)")
 
 
 class _InstrumentedCompletions:
-    def __init__(self, inner: Any):
+    def __init__(self, inner: Any, planning: Any = None):
         self._inner = inner
+        self._planning = planning
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -240,7 +259,7 @@ class _InstrumentedCompletions:
         meta = _request_meta(kwargs)
         result = self._inner.create(**kwargs)
         if hasattr(result, "__iter__") and not hasattr(result, "choices"):
-            return _InstrumentedStream(result, meta, t0)
+            return _InstrumentedStream(result, meta, t0, self._planning)
         # non-stream: ttft ölçülemez (tek parça döner) → None
         row = dict(meta)
         row.update(_usage_fields(_extra(result, "usage")))
@@ -253,7 +272,7 @@ class _InstrumentedCompletions:
         row["generation_id"] = _extra(result, "generationId", "id")
         # 3.1: non-stream — affinity alanları choices[0].message üzerinden
         row.update(_affinity_fields(_routing_dict(message)))
-        _after_request(row, meta)
+        _after_request(row, meta, self._planning)
         return result
 
 
@@ -274,16 +293,19 @@ def _request_meta(kwargs: dict) -> dict:
 
 
 class _InstrumentedChat:
-    def __init__(self, inner: Any):
+    def __init__(self, inner: Any, planning: Any = None):
         self._inner = inner
-        self.completions = _InstrumentedCompletions(inner.completions)
+        self.completions = _InstrumentedCompletions(inner.completions, planning)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
 
-def wrap_client(client: Any) -> Any:
-    """openai.OpenAI istemcisini instrumente eder; isinstance(client, OpenAI) korunur."""
+def wrap_client(client: Any, planning: Any = None) -> Any:
+    """Instrument an openai.OpenAI client; isinstance(client, OpenAI) is preserved.
+
+    ``planning`` is the plugin's planning module (passed in, not imported).
+    """
     inner_chat = client.chat
-    client.chat = _InstrumentedChat(inner_chat)  # type: ignore[assignment]
+    client.chat = _InstrumentedChat(inner_chat, planning)  # type: ignore[assignment]
     return client

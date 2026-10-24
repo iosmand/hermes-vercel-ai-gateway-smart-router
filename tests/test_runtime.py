@@ -56,7 +56,7 @@ def main() -> int:
     # ağ yok: her fetch çağrısı sayılır
     calls = {"n": 0}
 
-    def fake_fetch(model):
+    def fake_fetch(model, timeout=None):
         calls["n"] += 1
         return None
 

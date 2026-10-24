@@ -81,7 +81,7 @@ def test_failover_moves_lock():
         iter([delta_chunk(content="x", usage=usage_obj(10, 5), resolved="friendli", gen="gen_F")]),
         {"ts": "T", "model": "m", "session_id": "hermes-y", "session_key": "hermes-y",
          "provider_intended": "particle", "provider_actual": None,
-         "only_set": ["particle", "friendli"]}, 0.0)
+         "only_set": ["particle", "friendli"]}, 0.0, planning)
     list(stream)
     rows = [json.loads(l) for l in open(TMP / "ai-gateway-router" / "ledger.jsonl")]
     r = rows[-1]
@@ -103,7 +103,7 @@ def test_failover_outside_only_keeps_lock():
         iter([delta_chunk(content="x", usage=usage_obj(10, 5), resolved="runinfra", gen="gen_G")]),
         {"ts": "T", "model": "m", "session_id": "hermes-z", "session_key": "hermes-z",
          "provider_intended": "particle", "provider_actual": None,
-         "only_set": ["particle", "friendli"]}, 0.0)
+         "only_set": ["particle", "friendli"]}, 0.0, planning)
     list(stream)
     check("failover: only dışındaki sağlayıcıya kilit TUTULMAZ",
           planning.locked_provider("m", "hermes-z") == "particle",
