@@ -1,0 +1,289 @@
+"""transport.py — gerçek sağlayıcıyı yanıttan okuyan instrumented OpenAI istemcisi.
+
+2.1: en alt katman iki yerde görünüyor:
+  (a) çekirdek: agent/chat_completion_helpers.py:787  (non-stream: agent.client.chat.completions.create)
+                      agent/chat_completion_helpers.py:2959 (stream: request_client.chat.completions.create)
+  (b) plugin:  providers/base.py:329 ProviderProfile.create_client — çağrı yeri
+               agent/agent_runtime_helpers.py:1912 (_provider_supplied_client)
+Seçim: (b) — çekirdek dosyasına dokunmadan tek dosya. Bedeli: profil yalnız in-process çalışır
+(hermes_cli/plugin_host_child.py:520-523 create_client override'ında PluginHostUnsupported fırlatır).
+
+Yanıt gövdesindeki gerçek bilgi:
+  non-stream : choices[0].message.provider_metadata.gateway.routing.resolvedProvider
+  stream     : son chunk choices[0].delta.provider_metadata.gateway.routing.resolvedProvider
+  her ikisi  : generationId (üst düzey / son chunk)
+
+Ledger: istek başına BİR satır. Prompt/yanıt metni ASLA yazılmaz.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+LEDGER_LOCK = threading.Lock()
+
+
+def _state_dir() -> Path:
+    import os
+    home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+    d = home / "ai-gateway-router"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _extra(obj: Any, *names: str) -> Any:
+    """pydantic model_extra / dict / getattr üçlüsünden alan oku."""
+    if obj is None:
+        return None
+    for n in names:
+        v = getattr(obj, n, None)
+        if v is not None:
+            return v
+    me = getattr(obj, "model_extra", None)
+    if isinstance(me, dict):
+        for n in names:
+            if me.get(n) is not None:
+                return me[n]
+    if isinstance(obj, dict):
+        for n in names:
+            if obj.get(n) is not None:
+                return obj[n]
+    return None
+
+
+def _routing_dict(payload: Any) -> dict:
+    """provider_metadata.gateway.routing sözlüğü (yoksa boş)."""
+    pm = _extra(payload, "provider_metadata") or {}
+    gw = (pm.get("gateway") or {}) if isinstance(pm, dict) else {}
+    rt = gw.get("routing") or {}
+    return rt if isinstance(rt, dict) else {}
+
+
+def _routing(payload: Any) -> tuple[str | None, str | None, list[str]]:
+    """(resolvedProvider, generationId, fallbacksAvailable) — provider_metadata içinden."""
+    rt = _routing_dict(payload)
+    resolved = rt.get("resolvedProvider")
+    fallbacks = list(rt.get("fallbacksAvailable") or [])
+    return resolved, None, fallbacks
+
+
+def _affinity_fields(routing: dict) -> dict:
+    """3.1: routing/affinity alanları → ledger kolonları; eksik alan null."""
+    aff = routing.get("affinity") or {}
+    if not isinstance(aff, dict):
+        aff = {}
+    return {
+        "client_session_id": routing.get("clientSessionId"),
+        "client_session_id_source": routing.get("clientSessionIdSource"),
+        "affinity_outcome": aff.get("outcome"),
+        "affinity_pinned_provider": aff.get("pinnedProvider"),
+        "affinity_displaced_provider": aff.get("displacedProvider"),
+    }
+
+
+def _usage_fields(usage: Any) -> dict:
+    if usage is None:
+        return {}
+    pd = _extra(usage, "prompt_tokens_details") or {}
+    cd = _extra(usage, "completion_tokens_details") or {}
+    if not isinstance(pd, dict):
+        pd = {"cached_tokens": _extra(pd, "cached_tokens"), "cache_creation_tokens": _extra(pd, "cache_creation_tokens")}
+    if not isinstance(cd, dict):
+        cd = {"reasoning_tokens": _extra(cd, "reasoning_tokens")}
+    return {
+        "input_tokens": _extra(usage, "prompt_tokens", "input_tokens"),
+        "output_tokens": _extra(usage, "completion_tokens", "output_tokens"),
+        "cache_read_tokens": pd.get("cached_tokens"),
+        "cache_write_tokens": pd.get("cache_creation_tokens"),
+        "reasoning_tokens": cd.get("reasoning_tokens"),
+    }
+
+
+LEDGER_FIELDS = ("ts", "model", "session_id", "provider_intended", "provider_actual",
+                 "generation_id", "ttft_ms", "total_ms", "input_tokens", "output_tokens",
+                 "cache_read_tokens", "cache_write_tokens", "reasoning_tokens",
+                 # 3.1: affinity kolonları — eski satırlar değişmez, eksik alan null
+                 "client_session_id", "client_session_id_source",
+                 "affinity_outcome", "affinity_pinned_provider", "affinity_displaced_provider")
+
+
+def write_ledger_row(row: dict) -> None:
+    try:
+        row = {k: row.get(k) for k in LEDGER_FIELDS}
+        path = _state_dir() / "ledger.jsonl"
+        with LEDGER_LOCK, path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as exc:  # asla isteği düşürme
+        log.debug("ai-gateway-router: ledger yazılamadı: %s", exc)
+
+
+def ledger_enabled() -> bool:
+    import os
+    return (os.environ.get("HERMES_AI_GATEWAY_LEDGER") or "on").strip().lower() not in {"off", "0", "false", "no"}
+
+
+class _InstrumentedStream:
+    """openai Stream sarmalayıcısı: chunk'ları aynen geçirir, ölçüm alır."""
+
+    def __init__(self, inner: Any, meta: dict, t0: float):
+        self._inner = inner
+        self._it = iter(inner)
+        self._meta = meta
+        self._t0 = t0
+        self._ttft_ms: float | None = None
+        self._last_chunk: Any = None
+        self._done = False
+
+    # --- SDK yüzeyi: her şey delege ---
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            chunk = next(self._it)
+        except StopIteration:
+            self._finish()
+            raise
+        self._observe(chunk)
+        return chunk
+
+    def __enter__(self):
+        if hasattr(self._inner, "__enter__"):
+            self._inner.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        self._finish()
+        if hasattr(self._inner, "__exit__"):
+            return self._inner.__exit__(*exc)
+        return None
+
+    def close(self):
+        self._finish()
+        if hasattr(self._inner, "close"):
+            self._inner.close()
+
+    def _observe(self, chunk: Any) -> None:
+        self._last_chunk = chunk
+        if self._ttft_ms is None:
+            try:
+                choice = (getattr(chunk, "choices", None) or [None])[0]
+                delta = getattr(choice, "delta", None) if choice is not None else None
+                if delta is not None and (_extra(delta, "content") or _extra(delta, "reasoning_content")
+                                          or _extra(delta, "reasoning")):
+                    self._ttft_ms = (time.perf_counter() - self._t0) * 1000.0
+            except Exception:
+                pass
+
+    def _finish(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        total_ms = (time.perf_counter() - self._t0) * 1000.0
+        chunk = self._last_chunk
+        row = dict(self._meta)
+        row.update(_usage_fields(_extra(chunk, "usage") if chunk is not None else None))
+        row["ttft_ms"] = round(self._ttft_ms, 1) if self._ttft_ms is not None else None
+        row["total_ms"] = round(total_ms, 1)
+        if chunk is not None:
+            choices = getattr(chunk, "choices", None) or []
+            delta = getattr(choices[0], "delta", None) if choices else None
+            resolved, _, _ = _routing(delta)
+            row["generation_id"] = _extra(chunk, "generationId", "id")
+            row["provider_actual"] = resolved or row.get("provider_actual")
+            # 3.1: stream — affinity alanları SON chunk'ın delta'sı üzerinden
+            row.update(_affinity_fields(_routing_dict(delta)))
+        _after_request(row, self._meta)
+
+
+def _after_request(row: dict, meta: dict) -> None:
+    """2.4 ledger + 2.6 failover işleme (asla istisna fırlatmaz)."""
+    try:
+        if ledger_enabled():
+            write_ledger_row(row)
+        actual, intended = row.get("provider_actual"), meta.get("provider_intended")
+        if not actual or not intended:
+            return
+        only = meta.get("only_set") or []
+        session_key = meta.get("session_key")
+        model = meta.get("model")
+        if actual != intended:
+            log.warning("ai-gateway-router: failover model=%s intended=%s actual=%s",
+                        model, intended, actual)
+            if session_key and model and actual in only:
+                import planning
+                planning.lock_provider(model, session_key, actual)
+                log.warning("ai-gateway-router: kilit %s → %s taşındı (failover)",
+                            intended, actual)
+    except Exception as exc:
+        log.debug("ai-gateway-router: post-request işlenemedi: %s", exc)
+
+
+class _InstrumentedCompletions:
+    def __init__(self, inner: Any):
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def create(self, **kwargs: Any):
+        t0 = time.perf_counter()
+        meta = _request_meta(kwargs)
+        result = self._inner.create(**kwargs)
+        if hasattr(result, "__iter__") and not hasattr(result, "choices"):
+            return _InstrumentedStream(result, meta, t0)
+        # non-stream: ttft ölçülemez (tek parça döner) → None
+        row = dict(meta)
+        row.update(_usage_fields(_extra(result, "usage")))
+        row["ttft_ms"] = None
+        row["total_ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
+        choice = (getattr(result, "choices", None) or [None])[0]
+        message = getattr(choice, "message", None) if choice is not None else None
+        resolved, _, _ = _routing(message)
+        row["provider_actual"] = resolved
+        row["generation_id"] = _extra(result, "generationId", "id")
+        # 3.1: non-stream — affinity alanları choices[0].message üzerinden
+        row.update(_affinity_fields(_routing_dict(message)))
+        _after_request(row, meta)
+        return result
+
+
+def _request_meta(kwargs: dict) -> dict:
+    body = kwargs.get("extra_body") or {}
+    gw = (body.get("providerOptions") or {}).get("gateway") or {}
+    order = list(gw.get("order") or [])
+    only = list(gw.get("only") or order)
+    return {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "model": kwargs.get("model"),
+        "session_id": gw.get("sessionId"),
+        "session_key": gw.get("sessionId"),
+        "provider_intended": order[0] if order else None,
+        "provider_actual": None,
+        "only_set": only,
+    }
+
+
+class _InstrumentedChat:
+    def __init__(self, inner: Any):
+        self._inner = inner
+        self.completions = _InstrumentedCompletions(inner.completions)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def wrap_client(client: Any) -> Any:
+    """openai.OpenAI istemcisini instrumente eder; isinstance(client, OpenAI) korunur."""
+    inner_chat = client.chat
+    client.chat = _InstrumentedChat(inner_chat)  # type: ignore[assignment]
+    return client

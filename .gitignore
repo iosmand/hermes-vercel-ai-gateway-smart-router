@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Credentials and local Hermes installation
+.env
+.env.*
+!.env.example
+.hermes/
+
+# Live API/cache output
+.cache/
+bench-*.json
+usage.jsonl
+ledger*.jsonl
+generation_truth.jsonl
+stats/
+
+# Per-install router state
+sessions.json
+strikes.json
+demoted.json
+strike_pause.json
+collect_desktop.offset
+collect_desktop.pending.jsonl
+collect_desktop.missing.jsonl
+collect_desktop.cron.log
+*.log
+
+# Operator-specific generated configuration and backups
+rules.json
+plans.json
+precision-audit.json
+*.bak-*

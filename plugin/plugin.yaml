@@ -1,0 +1,5 @@
+name: ai-gateway-router
+kind: model-provider
+version: 1.0.0
+description: Vercel AI Gateway with model-level provider routing (plans.json → providerOptions.gateway)
+author: Osman
