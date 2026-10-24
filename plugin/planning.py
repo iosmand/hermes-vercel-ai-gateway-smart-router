@@ -90,12 +90,51 @@ def _stats_path(model: str) -> Path:
     return d / (model.replace("/", "__") + ".json")
 
 
+KEY_SEP = "\x1f"   # (model, provider) composite key separator
+
+
+def state_key(model: str | None, provider: str) -> str:
+    """Composite key so a failure on model A never quarantines model B."""
+    return f"{model}{KEY_SEP}{provider}" if model else provider
+
+
+def split_key(key: str) -> tuple[str | None, str]:
+    if KEY_SEP in key:
+        model, provider = key.split(KEY_SEP, 1)
+        return model, provider
+    return None, key
+
+
 def _json_state(name: str) -> dict:
     p = state_dir() / name
     try:
         return json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
     except Exception:
         return {}
+
+
+def _migrate_keys(data: dict) -> dict:
+    """Rewrite legacy provider-only keys as (model, provider) keys, in memory.
+
+    Old files stored ``{"particle": {...}}``; the record's own ``model`` field
+    says which model the entry belongs to, so nothing is lost.
+    """
+    out: dict = {}
+    for key, rec in (data or {}).items():
+        if KEY_SEP in str(key):
+            out[key] = rec
+            continue
+        model = (rec or {}).get("model") if isinstance(rec, dict) else None
+        out[state_key(model, str(key))] = rec
+    return out
+
+
+def _strikes() -> dict:
+    return _migrate_keys(_json_state("strikes.json"))
+
+
+def _demoted_raw() -> dict:
+    return _migrate_keys(_json_state("demoted.json"))
 
 
 def _save_state(name: str, data: dict) -> None:
@@ -505,7 +544,7 @@ def rank(model: str, rule: dict, endpoints: list[dict], demoted: dict) -> list[d
                 if ctx_floor and _ctx_of(e) < int(ctx_floor):
                     continue
                 prov = e.get("provider_name")
-                penalty_until = (demoted.get(prov) or {}).get("until", 0)
+                penalty_until = (demoted.get(state_key(model, prov)) or demoted.get(prov) or {}).get("until", 0)
                 if penalty_until and penalty_until > now:
                     continue
                 score = _score(e, wl, tv, quality_cfg, model_ctx, precision_known, metrics)
@@ -585,22 +624,43 @@ def release_provider(session_key: str) -> None:
             _save_state("sessions.json", state)
 
 
-def freshest_session(model: str) -> tuple[str, str] | None:
-    """Bir model için en son kullanılan (session_key, sağlayıcı) çifti."""
-    entries = [(k, v) for k, v in _sessions().items() if v.get("model") == model]
-    if not entries:
-        return None
-    key, rec = max(entries, key=lambda kv: float(kv[1].get("ts") or 0))
-    return key, rec.get("provider")
+# NOTE: the old ``freshest_session()`` fallback was removed. It had no TTL and
+# no session scope, so a request without strike context could strike the provider
+# of an unrelated conversation. Without context we record nothing.
+
+
+def candidate_pool(model: str) -> list[str]:
+    """Providers currently allowed for this model.
+
+    ``LAST_GATEWAY`` is process memory and is empty right after a restart, so the
+    pool is recomputed from the cached stats when the in-memory copy is missing.
+    """
+    rec = (LAST_GATEWAY.get(model) or {}).get("only") or []
+    if rec:
+        return list(rec)
+    try:
+        rule = rule_for(model)
+        if rule is None:
+            return []
+        endpoints, _stale = stats(model, float(rule.get("stats_ttl_s", DEFAULT_STATS_TTL)))
+        ranked = rank(model, rule, endpoints, demoted())
+        if not ranked:
+            return []
+        n = int(rule.get("max_candidates", 4))
+        return [r["provider"] for r in (ranked[:n] if n else ranked)]
+    except Exception:
+        return []
 
 
 def record_strike(model: str, session_key: str | None, provider: str | None, reason: str = "") -> str | None:
-    """Kilitli sağlayıcıya hata yaz. Eşik aşılırsa karantinaya alıp kilidi bırakır.
+    """Record a provider failure for (model, provider).
 
-    B3: aynı sağlayıcıya 30 sn'de en fazla 1 strike (retry'lar ayrı sayılmaz);
-    60 sn içinde 2 farklı sağlayıcı strike alırsa tüm strike'lar 5 dk durdurulur.
+    B3: at most one strike per provider per 30 s (retries are not new failures);
+    two different providers inside 60 s pause all strikes for 5 minutes.
+    Strikes and quarantine are keyed by (model, provider): a failure on model A
+    must never quarantine that provider for model B.
 
-    Dönüş: karantinaya alınan sağlayıcı adı (yoksa None).
+    Returns the quarantined provider name, or None.
     """
     if not provider:
         return None
@@ -611,8 +671,9 @@ def record_strike(model: str, session_key: str | None, provider: str | None, rea
             log.debug("ai-gateway-router: strike duraklaması aktif (%.0f sn) — %s yok sayıldı",
                       float(pause["until"]) - now, provider)
             return None
-        strikes = _json_state("strikes.json")
-        rec = strikes.get(provider) or {"count": 0, "ts": 0, "model": model}
+        key = state_key(model, provider)
+        strikes = _strikes()
+        rec = strikes.get(key) or {"count": 0, "ts": 0, "model": model}
         if now - float(rec.get("ts") or 0) > DEFAULT_DEMOTE_TTL:
             rec = {"count": 0, "ts": 0, "model": model}
         # B3: 30 sn içinde aynı sağlayıcıya tekrar — retry'dır, strike sayılmaz
@@ -625,9 +686,9 @@ def record_strike(model: str, session_key: str | None, provider: str | None, rea
         rec["model"] = model
         rec["reason"] = reason
         # B3: 60 sn içinde 2 farklı sağlayıcı strike aldıysa 5 dk strike dur
-        others = sorted(p for p, r in strikes.items()
-                        if p != provider and now - float((r or {}).get("ts") or 0) <= STRIKE_BURST_WINDOW_S)
-        strikes[provider] = rec
+        others = sorted({split_key(k)[1] for k, r in strikes.items()
+                         if k != key and now - float((r or {}).get("ts") or 0) <= STRIKE_BURST_WINDOW_S})
+        strikes[key] = rec
         if others:
             _save_state("strike_pause.json", {
                 "until": now + STRIKE_PAUSE_S, "reason": reason, "model": model,
@@ -636,18 +697,19 @@ def record_strike(model: str, session_key: str | None, provider: str | None, rea
                         "strike'lar 5 dk durduruldu", len(others) + 1, sorted(others + [provider]))
         hit = False
         if rec["count"] >= STRIKES_TO_DEMOTE:
-            demoted = _json_state("demoted.json")
+            demoted_state = _demoted_raw()
             # B4: only kümesinde karantina sonrası 2'den az aday kalıyorsa karantina YOK
-            only = (LAST_GATEWAY.get(model) or {}).get("only") or []
-            active = [p for p, r in demoted.items() if float((r or {}).get("until") or 0) > now]
+            only = (LAST_GATEWAY.get(model) or {}).get("only") or candidate_pool(model)
+            active = {split_key(k)[1] for k, r in demoted_state.items()
+                      if (split_key(k)[0] in (None, model)) and float((r or {}).get("until") or 0) > now}
             remaining = [p for p in only if p != provider and p not in active]
             if only and len(remaining) < 2:
                 log.warning("ai-gateway-router: karantina atlandı (%s) — only'de %d aday "
                             "kalıyor (<2): %s", provider, len(remaining), only)
             else:
-                demoted[provider] = {"until": now + DEFAULT_DEMOTE_TTL, "reason": reason, "model": model}
-                _save_state("demoted.json", demoted)
-                strikes.pop(provider, None)
+                demoted_state[key] = {"until": now + DEFAULT_DEMOTE_TTL, "reason": reason, "model": model}
+                _save_state("demoted.json", demoted_state)
+                strikes.pop(key, None)
                 hit = True
         _save_state("strikes.json", strikes)
         if hit:
@@ -660,10 +722,23 @@ def record_strike(model: str, session_key: str | None, provider: str | None, rea
         return provider if hit else None
 
 
-def demoted() -> dict:
-    d = _json_state("demoted.json")
+def demoted(model: str | None = None) -> dict:
+    """Active quarantine entries, keyed by (model, provider).
+
+    ``model`` filters to one model; legacy provider-only keys are matched only
+    when their record carries no model.
+    """
+    d = _demoted_raw()
     now = time.time()
-    return {k: v for k, v in d.items() if float(v.get("until") or 0) > now}
+    out = {}
+    for k, v in d.items():
+        if float((v or {}).get("until") or 0) <= now:
+            continue
+        m, _p = split_key(k)
+        if model is not None and m not in (None, model):
+            continue
+        out[k] = v
+    return out
 
 
 def infer_provider(model: str, input_tokens: int, output_tokens: int,
@@ -774,11 +849,11 @@ def build_gateway(model: str, session_key: str | None = None) -> dict:
         endpoints, stale = stats(model, float(rule.get("stats_ttl_s", DEFAULT_STATS_TTL)))
         if not endpoints:
             return {}
-        dem = demoted()
+        dem = demoted(model)
         ranked = rank(model, rule, endpoints, dem)
         if not ranked:
             live = [e for e in endpoints if isinstance(e, dict) and _status_num(e) == 0]
-            if live and all(e.get("provider_name") in dem for e in live):
+            if live and all(state_key(model, e.get("provider_name")) in dem for e in live):
                 _warn_routing_once(
                     model, "ai-gateway-router: %s — every provider is quarantined; routing is OFF "
                            "for this model until a quarantine expires", model)

@@ -25,6 +25,10 @@ import planning  # noqa: E402
 FAILED = []
 
 
+def struck() -> list[str]:
+    return sorted(planning.split_key(k)[1] for k in planning._json_state("strikes.json"))
+
+
 def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f"  {detail}" if detail else ""))
     if not ok:
@@ -61,26 +65,41 @@ key_a = plugin._session_key("oturum-A")
 key_b = plugin._session_key("oturum-B")
 
 
-def session_b_worker():
-    # B oturumu friendli'ye kilitli
-    prof.build_extra_body(session_id="oturum-B", model=MODEL)
-    prof.classify_api_error(None, status_code=503, message="HTTP 503", body=None, model=MODEL)
+def session_worker(session_id: str, fail: bool) -> None:
+    """One request thread: build the body, then classify (same thread, like Hermes)."""
+    prof.build_extra_body(session_id=session_id, model=MODEL)
+    if fail:
+        prof.classify_api_error(None, status_code=503, message="HTTP 503", body=None, model=MODEL)
 
 
-# --- 3.5: iki paralel oturum -------------------------------------------------
+# --- 3.5: two parallel sessions, real threads --------------------------------
 planning.lock_provider(MODEL, key_a, "particle")
 planning.lock_provider(MODEL, key_b, "friendli")
 planning._save_state("strikes.json", {})
 
-prof.build_extra_body(session_id="oturum-A", model=MODEL)   # A hata ALMAZ
-t = threading.Thread(target=session_b_worker)
-t.start(); t.join()
+# A hazırlanır (hata almaz), B aynı anda hata alır → yalnız B'nin sağlayıcısı vurulur
+threads = [threading.Thread(target=session_worker, args=("oturum-A", False)),
+           threading.Thread(target=session_worker, args=("oturum-B", True))]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
 
-strikes = planning._json_state("strikes.json")
 check("3.5: yalnız B'nin sağlayıcısı strike aldı",
-      list(strikes) == ["friendli"] and strikes["friendli"]["count"] == 1, str(strikes))
-check("3.5: A'nın sağlayıcısına strike yok", "particle" not in strikes, str(sorted(strikes)))
+      struck() == ["friendli"] and planning._json_state("strikes.json")[
+          planning.state_key(MODEL, "friendli")]["count"] == 1,
+      str(planning._json_state("strikes.json")))
+check("3.5: A'nın sağlayıcısına strike yok", "particle" not in struck(), str(struck()))
 check("3.5: karantina yok (tek strike)", planning.demoted() == {}, str(planning.demoted()))
+
+# --- 3.5b: classify on a DIFFERENT thread must not guess a session -----------
+planning._save_state("strikes.json", {})
+prof.build_extra_body(session_id="oturum-A", model=MODEL)   # bu thread'de ctx: particle
+t = threading.Thread(target=lambda: prof.classify_api_error(
+    None, status_code=503, message="HTTP 503", body=None, model=MODEL))
+t.start(); t.join()
+check("3.5b: başka thread'de bağlam yok → hiçbir sağlayıcıya strike yok",
+      struck() == [], str(planning._json_state("strikes.json")))
 
 # --- 3.2: hata gövdesi sağlayıcıyı adlandırıyor -------------------------------
 planning._save_state("strikes.json", {})
@@ -88,9 +107,8 @@ prof.build_extra_body(session_id="oturum-A", model=MODEL)   # ctx: kilitli = par
 prof.classify_api_error(
     None, status_code=503, message="HTTP 503",
     body={"error": {"message": "upstream failed", "provider_name": "runinfra"}}, model=MODEL)
-strikes = planning._json_state("strikes.json")
 check("3.2: gövdedeki sağlayıcı strike aldı (kilitli değil)",
-      list(strikes) == ["runinfra"], str(strikes))
+      struck() == ["runinfra"], str(planning._json_state("strikes.json")))
 
 # --- 3.4: gateway seviyesi 429 strike DEĞİL -----------------------------------
 planning._save_state("strikes.json", {})
@@ -105,9 +123,8 @@ check("3.4: sağlayıcı adlandırmayan 429 strike değil",
 prof.classify_api_error(
     None, status_code=429, message="HTTP 429",
     body={"provider": "parasail", "error": {"message": "rate limited"}}, model=MODEL)
-strikes = planning._json_state("strikes.json")
 check("3.4: sağlayıcı adlandıran 429 strike sayılır",
-      list(strikes) == ["parasail"], str(strikes))
+      struck() == ["parasail"], str(planning._json_state("strikes.json")))
 
 if FAILED:
     print(f"\n{len(FAILED)} test BAŞARISIZ: {FAILED}")

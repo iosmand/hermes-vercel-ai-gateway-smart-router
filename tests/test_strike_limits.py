@@ -143,7 +143,16 @@ def reset():
 
 
 def strike_of(provider: str) -> dict:
-    return planning._json_state("strikes.json").get(provider) or {}
+    return planning._json_state("strikes.json").get(planning.state_key(MODEL, provider)) or {}
+
+
+def struck_providers() -> list[str]:
+    """Provider names from (model, provider)-keyed strike state."""
+    return sorted(planning.split_key(k)[1] for k in planning._json_state("strikes.json"))
+
+
+def demoted_providers() -> list[str]:
+    return sorted(planning.split_key(k)[1] for k in planning._json_state("demoted.json"))
 
 
 def run_case(case: str):
@@ -154,9 +163,9 @@ def run_case(case: str):
     if case == "a":   # B5(a): gövde 1 sağlayıcı adlandırıyor → 1 strike
         exc = real_error(route_body("provA"))
         error_classifier.classify_api_error(exc, provider="ai-gateway", model=MODEL)
-        s = planning._json_state("strikes.json")
         check("B5(a): gövdedeki sağlayıcı 1 strike aldı",
-              list(s) == ["provA"] and s["provA"]["count"] == 1, str(s))
+              struck_providers() == ["provA"] and strike_of("provA").get("count") == 1,
+              str(planning._json_state("strikes.json")))
 
     elif case == "b":  # B5(b): 2 sağlayıcı → strike yok, global failure suspected
         exc = real_error(route_body("provA", "provB"))
@@ -170,9 +179,9 @@ def run_case(case: str):
             exc = real_error(route_body("provC"))
             error_classifier.classify_api_error(exc, provider="ai-gateway", model=MODEL)
             CLOCK["t"] += 3      # 3 deneme = 9 sn
-        s = planning._json_state("strikes.json")
         check("B5(c): 3 deneme/10 sn → tek strike",
-              list(s) == ["provC"] and s["provC"]["count"] == 1, str(s))
+              struck_providers() == ["provC"] and strike_of("provC").get("count") == 1,
+              str(planning._json_state("strikes.json")))
 
     elif case == "d":  # B5(d): 60 sn'de 2 farklı sağlayıcı → strike'lar durur
         exc = real_error(route_body("provD"))
@@ -184,10 +193,10 @@ def run_case(case: str):
         CLOCK["t"] += 10
         exc = real_error(route_body("provF"))
         error_classifier.classify_api_error(exc, provider="ai-gateway", model=MODEL)
-        s = planning._json_state("strikes.json")
         check("B5(d): ilk iki sağlayıcı strike aldı",
-              set(s) == {"provD", "provE"}, str(sorted(s)))
-        check("B5(d): üçüncü sağlayıcıya strike durdu", "provF" not in s, str(sorted(s)))
+              set(struck_providers()) == {"provD", "provE"}, str(struck_providers()))
+        check("B5(d): üçüncü sağlayıcıya strike durdu", "provF" not in struck_providers(),
+              str(struck_providers()))
         check("B5(d): 5 dk küresel duraklama yazıldı",
               pause.get("until", 0) > CLOCK["t"] and pause.get("until", 0) <= CLOCK["t"] + 300, str(pause))
 
@@ -198,9 +207,9 @@ def run_case(case: str):
         CLOCK["t"] += 31        # B3 soğuması dolsun ki 2. strike sayılsın
         exc = real_error(route_body("provX"))
         error_classifier.classify_api_error(exc, provider="ai-gateway", model=MODEL)
-        s = planning._json_state("strikes.json")
         d = planning._json_state("demoted.json")
-        check("B5(e): 2 strike sayıldı", s.get("provX", {}).get("count") == 2, str(s))
+        check("B5(e): 2 strike sayıldı", strike_of("provX").get("count") == 2,
+              str(planning._json_state("strikes.json")))
         check("B5(e): karantina ATLANDI (only'de <2 aday kalıyor)", d == {}, str(d))
         check("B5(e): atlandı loglandı", has_log("karantina atlandı"))
         # kontrol: 3 aday varsa karantina uygulanır
@@ -212,8 +221,8 @@ def run_case(case: str):
         CLOCK["t"] += 31
         exc = real_error(route_body("provX"))
         error_classifier.classify_api_error(exc, provider="ai-gateway", model=MODEL)
-        d2 = planning._json_state("demoted.json")
-        check("B5(e-kontrol): 3 adayda karantina UYGULANIR", "provX" in d2, str(d2))
+        check("B5(e-kontrol): 3 adayda karantina UYGULANIR", "provX" in demoted_providers(),
+              str(planning._json_state("demoted.json")))
 
 
 if __name__ == "__main__":

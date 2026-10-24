@@ -97,7 +97,7 @@ def main() -> int:
     check("strike: ilk hatada karantina yok", hit1 is None)
     # B3: 30 sn soğuma — 2. strike'ın sayılması için kaydı geriye al
     st = planning._json_state("strikes.json")
-    st["fast"]["ts"] = time.time() - planning.STRIKE_COOLDOWN_S - 1
+    st[f"{MODEL}\x1ffast"]["ts"] = time.time() - planning.STRIKE_COOLDOWN_S - 1
     planning._save_state("strikes.json", st)
     hit2 = planning.record_strike(MODEL, "sess-1", "fast", "HTTP 503")
     check("strike: ikinci hatada karantina", hit2 == "fast")

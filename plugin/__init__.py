@@ -295,6 +295,9 @@ class AIGatewayRouterProfile(_BaseProfile):
         karantinaya alınır — sonraki istek sıradaki sağlayıcıya kilitlenir.
         """
         try:
+            # F5d: with routing disabled there is no routing decision to punish.
+            if (os.environ.get("HERMES_AI_GATEWAY_ROUTING") or "").strip().lower() in {"off", "0", "false"}:
+                return None
             body = _full_body(error, body)                 # B1: tam gövde (SDK inner'ı tamamlar)
             failed = _failed_providers(body)               # B1: routing + eski anahtarlar
             body_provider = failed[0] if failed else None
@@ -332,18 +335,19 @@ class AIGatewayRouterProfile(_BaseProfile):
                               model, status_code, message or type(error).__name__, last_only)
 
                 ctx = _STRIKE_CTX.get()
+                # F5a: context from another model is not evidence about this one.
+                if ctx is not None and model and ctx.get("model") and ctx["model"] != model:
+                    log.debug("ai-gateway-router: strike bağlamı başka model için (%s != %s) — yok sayıldı",
+                              ctx.get("model"), model)
+                    ctx = None
                 target_provider = body_provider                  # 3.2: hata gövdesi sağlayıcıyı adlandırıyorsa
                 session_key = (ctx or {}).get("session_key")
                 if target_provider is None:
                     target_provider = (ctx or {}).get("locked_provider")  # 3.1: bu isteğin kilidi
                 if not ctx or not session_key:
-                    # 3.3: bağlam yok → uyarı + eski freshest_session yedeği
-                    log.warning("ai-gateway-router: strike bağlamı yok (model=%s) — "
-                                "freshest_session yedeği kullanılıyor", model)
-                if target_provider is None:
-                    hit = planning.freshest_session(model)
-                    if hit:
-                        session_key, target_provider = hit[0], hit[1]
+                    # 3.3: bağlam yok → uyarı; yedeğe DÜŞÜLMEZ (ilgisiz sağlayıcıyı vurmamak için)
+                    log.warning("ai-gateway-router: strike bağlamı yok (model=%s) — bu hata için "
+                                "strike yazılmadı", model)
                 if target_provider:
                     planning.record_strike(model, session_key, target_provider,
                                            f"HTTP {status_code or 'timeout'}")
