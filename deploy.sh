@@ -34,27 +34,28 @@ if [ "$do_plans" = 1 ]; then
   mkdir -p "$PLANS_DST"
   # rules.json operatöre özeldir ve git'e girmez. Kaynakta yoksa güvenli örnek kurulur.
   RULES_SRC="${HERMES_AI_GATEWAY_RULES_SOURCE:-$REPO/rules.json}"
-  if [ ! -f "$RULES_SRC" ]; then
-    RULES_SRC="$REPO/rules.example.json"
+  if [ -f "$RULES_SRC" ]; then
+    cp -f "$RULES_SRC" "$PLANS_DST/rules.json"
+    echo "kurallar → $PLANS_DST/rules.json"
+  elif [ -f "$PLANS_DST/rules.json" ]; then
+    echo "kurallar → mevcut $PLANS_DST/rules.json korundu"
+  else
+    cp -f "$REPO/rules.example.json" "$PLANS_DST/rules.json"
+    echo "kurallar → örnek $PLANS_DST/rules.json kuruldu"
   fi
-  cp -f "$RULES_SRC" "$PLANS_DST/rules.json"
-  if [ -f "$REPO/plans.json" ]; then
-    cp -f "$REPO/plans.json" "$PLANS_DST/plans.json"
-  fi
-  mkdir -p "$PLANS_DST/stats"
-  echo "kurallar → $PLANS_DST/rules.json"
 fi
 
 # Sözdizimi kontrolü; Hermes'in araç Python'u varsa kullan, yoksa PATH'teki python3.
-PY=$(ls -d "$HERMES_HOME"/tools/python-3*/bin/python3 2>/dev/null | sort -V | tail -1)
+PY=$(ls -d "$HERMES_HOME"/tools/python-3*/bin/python3 2>/dev/null | sort -V | tail -1 || true)
 PY=${PY:-$(command -v python3)}
-if [ -x "$PY" ]; then
+if [ "$do_plugin" = 1 ] && [ -x "$PY" ]; then
   PYTHONPATH="/usr/local/lib/hermes-agent${PYTHONPATH:+:$PYTHONPATH}" HERMES_HOME="$HERMES_HOME" "$PY" \
     -c "import ast; ast.parse(open('$PLUGIN_DST/__init__.py').read()); print('sözdizimi OK')"
 fi
 
 echo
 echo "Doğrulama:"
+if [ -d /usr/local/lib/hermes-agent ]; then
 PYTHONPATH="/usr/local/lib/hermes-agent${PYTHONPATH:+:$PYTHONPATH}" HERMES_HOME="$HERMES_HOME" "$PY" - <<'EOF' 
 from providers import get_provider_profile
 p = get_provider_profile("vercel")
@@ -62,3 +63,6 @@ print("  profil:", type(p).__name__, "| base_url:", p.base_url)
 body = p.build_extra_body(session_id="test-session", model="zai/glm-5.3-flash")
 import json; print("  gövde :", json.dumps(body, ensure_ascii=False))
 EOF
+else
+  echo "  (hermes-agent kurulu değil; doğrulama atlandı)"
+fi

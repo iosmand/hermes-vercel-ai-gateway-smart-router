@@ -41,8 +41,9 @@ oturum kimliği, ledger veya API anahtarı içermez:
    ./deploy.sh
    ```
 
-`deploy.sh` bir gateway yeniden başlatması yapmaz. Kaynakta `rules.json`
-yoksa `rules.example.json` dosyasını hedefte `rules.json` olarak kurar.
+`deploy.sh` bir gateway yeniden başlatması yapmaz. Kaynakta operatöre özel
+`rules.json` yoksa, hedefteki mevcut `rules.json` korunur; yalnızca ilk
+kurulumda `rules.example.json` dosyası örnek olarak kurulur.
 
 ## Kural biçimi
 
