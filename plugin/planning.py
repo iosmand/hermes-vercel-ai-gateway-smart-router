@@ -26,6 +26,8 @@ import os
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -279,6 +281,20 @@ def _api_key() -> str | None:
     return None
 
 
+class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse cross-host/scheme redirects so the Authorization header never leaks."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urllib.parse.urlsplit(req.full_url)
+        new = urllib.parse.urlsplit(newurl)
+        if (old.scheme, old.netloc) != (new.scheme, new.netloc):
+            raise urllib.error.HTTPError(newurl, code, "cross-host redirect refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_SameHostRedirect)
+
+
 def _fetch_endpoints(model: str, timeout: float = 20.0) -> dict | None:
     key = _api_key()
     if not key:
@@ -287,7 +303,7 @@ def _fetch_endpoints(model: str, timeout: float = 20.0) -> dict | None:
         f"{BASE}/models/{model}/endpoints",
         headers={"Authorization": "Bearer " + key, "User-Agent": "hermes-ai-gateway-router"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _OPENER.open(req, timeout=timeout) as resp:
         return json.loads(resp.read())["data"]
 
 
@@ -897,7 +913,7 @@ def lookup_generation(generation_id: str, retries: int = 6, delay: float = 5.0) 
                 f"{BASE}/generation?id={generation_id}",
                 headers={"Authorization": "Bearer " + key, "User-Agent": "hermes-ai-gateway-router"},
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with _OPENER.open(req, timeout=15) as resp:
                 data = json.loads(resp.read()).get("data") or {}
             if data.get("provider_name"):
                 return data

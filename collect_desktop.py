@@ -46,6 +46,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -232,13 +233,27 @@ def desktop_sessions(home: Path) -> set[str] | None:
 
 
 # ----------------------------------------------------------------- generation
+class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse cross-host redirects so the API key is never forwarded elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urllib.parse.urlsplit(req.full_url)
+        new = urllib.parse.urlsplit(newurl)
+        if (old.scheme, old.netloc) != (new.scheme, new.netloc):
+            raise urllib.error.HTTPError(newurl, code, "cross-host redirect refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_SameHostRedirect)
+
+
 def fetch_generation(gen_id: str, key: str, timeout: float = 60.0) -> tuple[dict | None, str, str]:
     """(data, kind, detail); kind ∈ ok | not_ready | auth | transient | fatal."""
     req = urllib.request.Request(
         f"https://ai-gateway.vercel.sh/v1/generation?id={gen_id}",
         headers={"Authorization": "Bearer " + key})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             payload = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         if exc.code == 404:

@@ -186,12 +186,14 @@ def test_affinity_missing_nulls():
          "only_set": ["particle"]}, 0.0)
     list(s)
     r = [json.loads(l) for l in open(TMP / "ai-gateway-router" / "ledger.jsonl")][-1]
+    AFFINITY = ("client_session_id", "client_session_id_source", "affinity_outcome",
+                "affinity_pinned_provider", "affinity_displaced_provider")
     check("affinity eksik: 5 alan null",
-          all(r[k] is None for k in transport.LEDGER_FIELDS[-5:]),
-          json.dumps({k: r[k] for k in transport.LEDGER_FIELDS[-5:]}))
-    # sütunlar her satırda var (eski alan listesi korunuyor)
-    check("affinity eksik: alan listesi 18 kolon",
-          len(transport.LEDGER_FIELDS) == 18 and list(r.keys()) == list(transport.LEDGER_FIELDS),
+          all(r[k] is None for k in AFFINITY),
+          json.dumps({k: r[k] for k in AFFINITY}))
+    # sütunlar her satırda var (18 alan + sonuç kolonu)
+    check("ledger: alan listesi 19 kolon (18 + outcome)",
+          len(transport.LEDGER_FIELDS) == 19 and list(r.keys()) == list(transport.LEDGER_FIELDS),
           str(len(transport.LEDGER_FIELDS)))
 
 

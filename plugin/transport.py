@@ -110,15 +110,42 @@ LEDGER_FIELDS = ("ts", "model", "session_id", "provider_intended", "provider_act
                  "cache_read_tokens", "cache_write_tokens", "reasoning_tokens",
                  # 3.1: affinity kolonları — eski satırlar değişmez, eksik alan null
                  "client_session_id", "client_session_id_source",
-                 "affinity_outcome", "affinity_pinned_provider", "affinity_displaced_provider")
+                 "affinity_outcome", "affinity_pinned_provider", "affinity_displaced_provider",
+                 # stream tüketilmeden kapandıysa "aborted"; eksik alan ok/None sayılır
+                 "outcome")
+
+LEDGER_MAX_BYTES = 5_000_000     # rotate to ledger.jsonl.1 past this size
+LEDGER_MAX_ENV = "HERMES_AI_GATEWAY_LEDGER_MAX_BYTES"
+
+
+def _ledger_max_bytes() -> int:
+    import os
+    try:
+        return int(os.environ.get(LEDGER_MAX_ENV) or LEDGER_MAX_BYTES)
+    except ValueError:
+        return LEDGER_MAX_BYTES
+
+
+def _rotate_if_needed(path: Path) -> None:
+    """Keep one previous file; a runaway ledger must not fill the disk."""
+    limit = _ledger_max_bytes()
+    if limit <= 0:
+        return
+    try:
+        if path.exists() and path.stat().st_size >= limit:
+            path.replace(path.with_name(path.name + ".1"))
+    except OSError:
+        pass
 
 
 def write_ledger_row(row: dict) -> None:
     try:
         row = {k: row.get(k) for k in LEDGER_FIELDS}
         path = _state_dir() / "ledger.jsonl"
-        with LEDGER_LOCK, path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with LEDGER_LOCK:
+            _rotate_if_needed(path)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception as exc:  # asla isteği düşürme
         log.debug("ai-gateway-router: ledger yazılamadı: %s", exc)
 
@@ -140,6 +167,8 @@ class _InstrumentedStream:
         self._ttft_ms: float | None = None
         self._last_chunk: Any = None
         self._done = False
+        self._completed = False
+        self._aborted = False
 
     # --- SDK yüzeyi: her şey delege ---
     def __getattr__(self, name: str) -> Any:
@@ -152,6 +181,7 @@ class _InstrumentedStream:
         try:
             chunk = next(self._it)
         except StopIteration:
+            self._completed = True
             self._finish()
             raise
         self._observe(chunk)
@@ -162,11 +192,21 @@ class _InstrumentedStream:
             self._inner.__enter__()
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, exc_type=None, *exc):
+        if exc_type is not None or not self._completed:
+            self._aborted = True
         self._finish()
         if hasattr(self._inner, "__exit__"):
-            return self._inner.__exit__(*exc)
+            return self._inner.__exit__(exc_type, *exc)
         return None
+
+    def __del__(self):  # finalizer: never lose a billed row on an abandoned stream
+        try:
+            if not self._done:
+                self._aborted = True
+                self._finish()
+        except Exception:
+            pass
 
     def close(self):
         self._finish()
@@ -186,9 +226,16 @@ class _InstrumentedStream:
                 pass
 
     def _finish(self) -> None:
+        """Ledger bookkeeping — must never break a billed response."""
         if self._done:
             return
         self._done = True
+        try:
+            self._write_row()
+        except Exception:
+            log.warning("ai-gateway-router: ledger satırı yazılamadı (stream)", exc_info=True)
+
+    def _write_row(self) -> None:
         total_ms = (time.perf_counter() - self._t0) * 1000.0
         chunk = self._last_chunk
         row = dict(self._meta)
@@ -203,6 +250,7 @@ class _InstrumentedStream:
             row["provider_actual"] = resolved or row.get("provider_actual")
             # 3.1: stream — affinity alanları SON chunk'ın delta'sı üzerinden
             row.update(_affinity_fields(_routing_dict(delta)))
+        row["outcome"] = "aborted" if self._aborted else "ok"
         _after_request(row, self._meta, self._planning)
 
 
@@ -261,18 +309,22 @@ class _InstrumentedCompletions:
         if hasattr(result, "__iter__") and not hasattr(result, "choices"):
             return _InstrumentedStream(result, meta, t0, self._planning)
         # non-stream: ttft ölçülemez (tek parça döner) → None
-        row = dict(meta)
-        row.update(_usage_fields(_extra(result, "usage")))
-        row["ttft_ms"] = None
-        row["total_ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
-        choice = (getattr(result, "choices", None) or [None])[0]
-        message = getattr(choice, "message", None) if choice is not None else None
-        resolved, _, _ = _routing(message)
-        row["provider_actual"] = resolved
-        row["generation_id"] = _extra(result, "generationId", "id")
-        # 3.1: non-stream — affinity alanları choices[0].message üzerinden
-        row.update(_affinity_fields(_routing_dict(message)))
-        _after_request(row, meta, self._planning)
+        try:
+            row = dict(meta)
+            row.update(_usage_fields(_extra(result, "usage")))
+            row["ttft_ms"] = None
+            row["total_ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
+            choice = (getattr(result, "choices", None) or [None])[0]
+            message = getattr(choice, "message", None) if choice is not None else None
+            resolved, _, _ = _routing(message)
+            row["provider_actual"] = resolved
+            row["generation_id"] = _extra(result, "generationId", "id")
+            # 3.1: non-stream — affinity alanları choices[0].message üzerinden
+            row.update(_affinity_fields(_routing_dict(message)))
+            row["outcome"] = "ok"
+            _after_request(row, meta, self._planning)
+        except Exception:
+            log.warning("ai-gateway-router: ledger satırı yazılamadı (non-stream)", exc_info=True)
         return result
 
 
