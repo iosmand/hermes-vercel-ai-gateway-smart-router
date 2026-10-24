@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 FAILS: list[str] = []
@@ -102,6 +103,26 @@ check("F1c: 'has' never rejects a provider that 'only' allows",
       not contradiction, json.dumps(gw_c))
 check("F1c: undeclared provider still routable (only keeps it)",
       "undeclared" in gw_c.get("only", []), json.dumps(gw_c))
+
+# --- F1d: everything quarantined keeps the precision filter ('has' only) ---
+eps_d = [ep("alpha", quant="fp8"), ep("beta", quant="fp8"), ep("fp4-d", quant="fp4")]
+r_d = rule(require_tools=False, min_uptime_15m=0,
+           precision={"mode": "strict", "require": "fp8"})
+planning.rule_for = lambda model: r_d
+planning.stats = lambda model, ttl=600.0: (eps_d, False)
+_dem = {planning.state_key("m/f1d", "alpha"): time.time(),
+        planning.state_key("m/f1d", "beta"): time.time(),
+        planning.state_key("m/f1d", "fp4-d"): time.time()}
+_orig_demoted = planning.demoted
+planning.demoted = lambda model: dict(_dem)
+gw_d = planning.build_gateway("m/f1d", None)
+check("F1d: all quarantined → only 'has' is sent (precision kept)", gw_d == {"has": ["quantization:fp8"]}, json.dumps(gw_d))
+check("F1d: no 'order'/'only' when the ranking is empty",
+      "order" not in gw_d and "only" not in gw_d, json.dumps(gw_d))
+check("F1d: the quarantine WARNING names the model",
+      any(rec.levelno == logging.WARNING and "m/f1d" in rec.getMessage() for rec in capture.records),
+      str([rec.getMessage() for rec in capture.records][-3:]))
+planning.demoted = _orig_demoted
 
 # --- F1e: HTTP 400 no_capable_providers_available is reported, not swallowed ---
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin"))

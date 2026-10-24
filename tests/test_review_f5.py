@@ -160,5 +160,39 @@ check("F5: a timeout (no status code) records a strike",
       planning.state_key(A, "p1") in planning._json_state("strikes.json"),
       str(planning._json_state("strikes.json")))
 
+# --- session_ttl_s: the pin's idle TTL is a rule key, not a constant ---
+def _seed_pin(provider: str, age_s: float, session: str = "sess-ttl") -> None:
+    planning._save_state("sessions.json", {
+        session: {"model": A, "provider": provider, "ts": time.time() - age_s}})
+
+
+def _order_for(ttl: float | None) -> list[str]:
+    rule = {"session_affinity": True, "require_tools": False, "min_uptime_15m": 0,
+            "precision": {"mode": "any"}, "max_candidates": 4,
+            "time_value_cents_per_s": 0.15}
+    if ttl is not None:
+        rule["session_ttl_s"] = ttl
+    planning.rule_for = lambda model: rule
+    planning.stats = lambda model, ttl_=600.0: ([
+        ep("beta", pin=3e-7), ep("alpha2", pin=1e-7)], False)   # beta is pinned but pricier
+    gw = planning.build_gateway(A, "sess-ttl")
+    return gw.get("only") or []
+
+
+_seed_pin("beta", age_s=120.0)
+order_long = _order_for(3600.0)     # build_gateway re-locks, so seed again below
+_seed_pin("beta", age_s=120.0)
+order_short = _order_for(60.0)
+check("session_ttl_s: taze pin (TTL 3600) önde tutulur",
+      bool(order_long) and order_long[0] == "beta", str(order_long))
+check("session_ttl_s: TTL 60 geçmiş pini düşürür",
+      bool(order_short) and order_short[0] != "beta", str(order_short))
+
+_seed_pin("beta", age_s=0.0)
+check("session_ttl_s: yeni pin okunur",
+      planning.locked_provider(A, "sess-ttl", 60.0) == "beta")
+check("session_ttl_s: TTL dışındaki pin yok sayılır",
+      planning.locked_provider(A, "sess-ttl", 0.0) is None)
+
 print(f"\n{len(FAILS)} hata" if FAILS else "\ntüm testler geçti")
 sys.exit(1 if FAILS else 0)

@@ -40,7 +40,7 @@ BASE = "https://ai-gateway.vercel.sh/v1"
 LAST_GATEWAY: dict[str, dict] = {}   # model → son üretilen order/only (1.4 log için)
 
 DEFAULT_STATS_TTL = 600.0     # 10 dakika
-DEFAULT_SESSION_TTL = 21600.0  # 6 saat
+DEFAULT_SESSION_TTL = 21600.0  # 6 h idle TTL; override per model with session_ttl_s
 DEFAULT_DEMOTE_TTL = 600.0     # 10 dakika
 STRIKES_TO_DEMOTE = 2
 STRIKE_COOLDOWN_S = 30.0       # B3: aynı sağlayıcıya 30 sn'de en fazla 1 strike
@@ -200,7 +200,7 @@ RULE_KEYS = {
     "role", "precision", "precision_policy", "workload", "require_tools",
     "require_metrics", "missing_metric_penalty", "min_uptime_15m", "min_context",
     "model_context", "max_candidates", "time_value_cents_per_s",
-    "session_affinity", "stats_ttl_s", "quality",
+    "session_affinity", "session_ttl_s", "stats_ttl_s", "quality",
 }
 PRECISION_MODES = {"auto", "strict", "exclude", "any"}
 _VALIDATED_MTIME: dict[str, float] = {}
@@ -232,7 +232,7 @@ def validate_rules(data: dict) -> list[str]:
             if key in rule and not isinstance(rule[key], bool):
                 problems.append(f"models[{name}].{key}: bool olmalı")
         for key in ("min_uptime_15m", "min_context", "max_candidates",
-                    "time_value_cents_per_s", "stats_ttl_s",
+                    "time_value_cents_per_s", "stats_ttl_s", "session_ttl_s",
                     "missing_metric_penalty", "model_context"):
             if key in rule and rule[key] is not None:
                 try:
@@ -714,11 +714,18 @@ def _sessions() -> dict:
     return _json_state("sessions.json")
 
 
-def locked_provider(model: str, session_key: str) -> str | None:
+def locked_provider(model: str, session_key: str, ttl: float | None = None) -> str | None:
+    """Pinned provider for this session, or None once the idle TTL has passed.
+
+    ``ttl`` comes from the rule's ``session_ttl_s`` (default DEFAULT_SESSION_TTL);
+    the timestamp is refreshed by touch_provider() while the pin is in use, so the
+    value is an *idle* TTL, not an absolute lifetime.
+    """
     rec = (_sessions().get(session_key) or {})
     if rec.get("model") != model:
         return None
-    if time.time() - float(rec.get("ts") or 0) > DEFAULT_SESSION_TTL:
+    limit = DEFAULT_SESSION_TTL if ttl is None else float(ttl)
+    if time.time() - float(rec.get("ts") or 0) > limit:
         return None
     return rec.get("provider")
 
@@ -740,12 +747,14 @@ def touch_provider(model: str, session_key: str, provider: str, min_age: float =
         _save_state("sessions.json", state)
 
 
-def lock_provider(model: str, session_key: str, provider: str) -> None:
+def lock_provider(model: str, session_key: str, provider: str,
+                  ttl: float | None = None) -> None:
     with _LOCK, state_lock():
         state = _sessions()
         state[session_key] = {"model": model, "provider": provider, "ts": time.time()}
         now = time.time()
-        state = {k: v for k, v in state.items() if now - float(v.get("ts") or 0) <= DEFAULT_SESSION_TTL}
+        limit = DEFAULT_SESSION_TTL if ttl is None else float(ttl)
+        state = {k: v for k, v in state.items() if now - float(v.get("ts") or 0) <= limit}
         _save_state("sessions.json", state)
 
 
@@ -959,9 +968,16 @@ def build_gateway(model: str, session_key: str | None = None) -> dict:
         if not ranked:
             live = [e for e in endpoints if isinstance(e, dict) and _status_num(e) == 0]
             if live and all(state_key(model, e.get("provider_name")) in dem for e in live):
+                # F1d: quarantining everything must not drop the precision policy.
+                # Without an order/only set the gateway picks any provider, so we
+                # keep sending `has` (precision stays enforced) and only lose the
+                # ranking. Whitelisted providers are back after 10 minutes.
                 _warn_routing_once(
-                    model, "ai-gateway-router: %s — every provider is quarantined; routing is OFF "
-                           "for this model until a quarantine expires", model)
+                    model, "ai-gateway-router: %s — every provider is quarantined; ranking is OFF "
+                           "for this model until a quarantine expires (has=%s still sent)",
+                    model, has_server_filter(rule, endpoints) or None)
+                h = has_server_filter(rule, endpoints)
+                return {"has": h} if h else {}
             else:
                 _warn_routing_once(
                     model, "ai-gateway-router: %s — no provider passes the rule filters "
@@ -992,7 +1008,8 @@ def build_gateway(model: str, session_key: str | None = None) -> dict:
             order = kept
 
         if session_key and rule.get("session_affinity", True):
-            pinned = locked_provider(model, session_key)
+            ttl = rule.get("session_ttl_s")
+            pinned = locked_provider(model, session_key, ttl)
             if pinned and pinned in order:
                 order = [pinned] + [p for p in order if p != pinned]
                 touch_provider(model, session_key, pinned)
@@ -1000,7 +1017,7 @@ def build_gateway(model: str, session_key: str | None = None) -> dict:
                 release_provider(session_key)
                 pinned = None
             if not pinned:
-                lock_provider(model, session_key, order[0])
+                lock_provider(model, session_key, str(order[0]), ttl)
 
         # 1.2: only == order (filtre sonrası, max_candidates adet). Kuyruk kapanır;
         # 1.4: hepsi başarısız olursa istek düşer, küme asla genişletilmez.
