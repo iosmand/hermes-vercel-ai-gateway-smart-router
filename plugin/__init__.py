@@ -1,3 +1,6 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """Vercel AI Gateway provider profile — model bazlı sağlayıcı yönlendirmesi.
 
 Bundled `ai-gateway` profilini gölgeler (registry'de son kayıt kazanır) ve
@@ -8,14 +11,18 @@ Bundled `ai-gateway` profilini gölgeler (registry'de son kayıt kazanır) ve
     sessionId        → Hermes oturum kimliğinden türetilmiş opak anahtar
     sessionAffinity  → prompt cache'i aynı sağlayıcıda tut
 
-Plan dosyası `plans.json` (plan.py üretir), sıcak yeniden yüklenir:
-mtime değişince bir sonraki istekte okunur — Hermes'i yeniden başlatmak gerekmez.
+Kurallar `$HERMES_HOME/ai-gateway-router/rules.json` dosyasından okunur ve sıcak
+yeniden yüklenir: mtime değişince bir sonraki istekte okunur — Hermes'i yeniden
+başlatmak gerekmez.
 
 Ortam değişkenleri
 ------------------
-HERMES_AI_GATEWAY_PLANS   plan dosyası yolu (varsayılan: $HERMES_HOME/ai-gateway-router/plans.json)
-HERMES_AI_GATEWAY_ROUTING off → enjeksiyon tamamen kapanır
-HERMES_AI_GATEWAY_LEDGER  1  → istek başına maliyet $HERMES_HOME/ai-gateway-router/usage.jsonl'e yazılır
+HERMES_AI_GATEWAY_ROUTING        off/0/false → enjeksiyon ve strike kaydı tamamen kapanır
+HERMES_AI_GATEWAY_LEDGER         off/0/false → ledger satırı yazılmaz (varsayılan: açık)
+HERMES_AI_GATEWAY_LEDGER_MAX_BYTES  ledger.jsonl bu boyutu aşınca .1'e döner (varsayılan 5 MB)
+HERMES_AI_GATEWAY_RULES          alternatif rules.json yolu
+HERMES_AI_GATEWAY_STATS_TTL      istatistik cache TTL'i (saniye)
+HERMES_AI_GATEWAY_LOG_UTC        collect_desktop: log damgaları UTC ise 1
 """
 
 from __future__ import annotations

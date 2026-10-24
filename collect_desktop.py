@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """collect_desktop.py — collect desktop turns from agent.log and write a ledger.
 
 Why: desktop turns bypass the transport wrapper, so they produce no ledger rows.

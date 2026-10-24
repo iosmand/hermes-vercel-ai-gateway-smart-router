@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """FP8 provider benchmark — streaming ile gerçek TTFT / throughput / maliyet ölçümü.
 
 Katalog metrikleri (throughput_last_1h, latency_last_1h) Vercel'in kendi

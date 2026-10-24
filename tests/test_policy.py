@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """Politika doğrulama testleri — sentetik sağlayıcılarla seçim kurallarını sınar.
 
 Çalıştır: python3 tests/test_policy.py   (veya depo kökünden python3 -m tests.test_policy)

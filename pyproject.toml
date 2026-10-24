@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-vercel-ai-gateway-smart-router"
+version = "1.1.0"
+description = "Hermes model-provider plugin: model-level provider routing for the Vercel AI Gateway"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MPL-2.0" }
+authors = [{ name = "Osman" }]
+classifiers = [
+    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=6"]
+dev = ["PyYAML>=6"]
+
+[tool.setuptools]
+py-modules = ["collect_desktop", "plan", "gwroute", "bench", "ledger_probe", "verify_provider"]
+
+[tool.setuptools.packages.find]
+include = ["plugin*"]

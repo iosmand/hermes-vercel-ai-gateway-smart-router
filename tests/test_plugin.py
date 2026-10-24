@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """Plugin sözleşme testleri.
 
 Hermes'in kendi kayıt mekanizmasını (providers registry) kullanarak çalışır:
@@ -12,8 +15,52 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
+
+# A throwaway HERMES_HOME with seeded rules + stats: the test never depends on
+# (and never writes to) the real installation.
+HOME = Path(tempfile.mkdtemp(prefix="gw-plugin-test-"))
+os.environ["HERMES_HOME"] = str(HOME)
+STATE = HOME / "ai-gateway-router"
+(STATE / "stats").mkdir(parents=True, exist_ok=True)
+MODEL = "zai/glm-5.3-flash"
+
+def _ep(name: str, quant: str, pin: float = 1e-7, pout: float = 4e-7) -> dict:
+    return {"provider_name": name, "quantization": quant, "status": 0,
+            "pricing": {"prompt": pin, "completion": pout, "input_cache_read": pin / 10},
+            "uptime_last_15m": 100, "uptime_last_1h": 100, "uptime_last_1d": 100,
+            "throughput_last_1h": {"p50": 100}, "latency_last_1h": {"p50": 800},
+            "tags": ["tool-use", "structured-output"], "context_length": 10 ** 6}
+
+(STATE / "rules.json").write_text(json.dumps({"models": {MODEL: {
+    "precision": {"mode": "strict", "require": "fp8"},
+    "workload": {"input_tokens": 8000, "output_tokens": 1200, "cached_ratio": 0.5},
+    "require_tools": True, "min_uptime_15m": 95, "max_candidates": 4,
+    "session_affinity": True, "stats_ttl_s": 600,
+}}}), encoding="utf-8")
+(STATE / "stats" / (MODEL.replace("/", "__") + ".json")).write_text(json.dumps({
+    "fetched_at": time.time(),
+    "endpoints": [_ep("particle", "fp8"), _ep("friendli", "fp8", 1.2e-7, 4.8e-7),
+                  _ep("fp4-prov", "fp4", 0.6e-7, 2.4e-7)],
+}), encoding="utf-8")
+
+# Tell the plugin loader that this process is already in-process: without it the
+# loader reads the profile config (and hermes_yaml → ruamel), which a bare test
+# environment may not ship.
+os.environ.setdefault("HERMES_PLUGIN_HOST_PROCESS", "1")
+
+# Install the plugin into the throwaway home so the registry picks it up
+# (same layout deploy.sh creates).
+_PLUGIN_SRC = Path(__file__).resolve().parents[1] / "plugin"
+_PLUGIN_DST = HOME / "plugins" / "model-providers" / "ai-gateway"
+_PLUGIN_DST.mkdir(parents=True, exist_ok=True)
+for _name in ("__init__.py", "planning.py", "transport.py", "plugin.yaml"):
+    (_PLUGIN_DST / _name).write_text((_PLUGIN_SRC / _name).read_text(encoding="utf-8"),
+                                     encoding="utf-8")
 
 FAILS: list[str] = []
 
@@ -93,7 +140,11 @@ def main() -> int:
     check("maliyet: maliyet yoksa None", p.get_usage_cost("m", FakeUsage(raw_usage={})) is None)
 
     # 8) başka sağlayıcılar etkilenmiyor
-    orp = get_provider_profile("openrouter")
+    try:
+        orp = get_provider_profile("openrouter")
+    except ImportError as exc:      # a bare environment without ruamel.yaml
+        print(f"[SKIP] izolasyon kontrolü: {exc}")
+        orp = None
     if orp is not None and type(orp).__name__ != "AIGatewayRouterProfile":
         body8 = orp.build_extra_body(session_id="s", model="anthropic/claude-opus-5")
         check("izolasyon: openrouter gövdesinde providerOptions yok",

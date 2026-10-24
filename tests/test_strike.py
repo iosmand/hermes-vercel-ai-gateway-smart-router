@@ -1,3 +1,6 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """test_strike.py — strike hedefi testleri (ağ yok; planning.stats taklitli).
 
 3.5: iki paralel oturum, aynı model. Oturum B 503 alır → yalnız B'nin sağlayıcısı strike alır.

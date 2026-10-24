@@ -1,5 +1,7 @@
 name: ai-gateway-router
 kind: model-provider
-version: 1.0.0
-description: Vercel AI Gateway with model-level provider routing (plans.json → providerOptions.gateway)
+version: 1.1.0
+description: Vercel AI Gateway with model-level provider routing (rules.json → providerOptions.gateway)
 author: Osman
+license: MPL-2.0
+homepage: https://github.com/iosmand/hermes-vercel-ai-gateway-smart-router

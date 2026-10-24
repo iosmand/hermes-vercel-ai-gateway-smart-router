@@ -1,3 +1,6 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """Çalışma zamanı planlayıcı — plugin'in içinden çağrılır.
 
 `gwroute.py`'deki skor formülünün aynısını kullanır, ama CLI'ya bağlı değildir:
@@ -924,37 +927,9 @@ def lookup_generation(generation_id: str, retries: int = 6, delay: float = 5.0) 
     return None
 
 
-def record_truth(generation_id: str, intended: str | None, model: str) -> None:
-    """Arka planda gerçek sağlayıcıyı doğrula ve generation_truth.jsonl'e yaz."""
-    def _work() -> None:
-        data = lookup_generation(generation_id)
-        if not data:
-            return
-        try:
-            path = state_dir() / "generation_truth.jsonl"
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "model": model,
-                    "generation_id": generation_id,
-                    "provider_actual": data.get("provider_name"),
-                    "provider_intended": intended,
-                    "match": (data.get("provider_name") == intended) if intended else None,
-                    "cost_usd": data.get("total_cost"),
-                    "latency_ms": data.get("latency"),
-                    "generation_time_ms": data.get("generation_time"),
-                    "finish_reason": data.get("finish_reason"),
-                    "streamed": data.get("streamed"),
-                }, ensure_ascii=False) + "\n")
-        except Exception as exc:
-            log.debug("ai-gateway-router: truth yazılamadı: %s", exc)
-
-    threading.Thread(target=_work, name="gw-truth", daemon=True).start()
-
-
 def _passes_has(e: dict, has: list[str]) -> bool:
     """True when the endpoint satisfies every entry of a gateway ``has`` list."""
-    quant = (e.get("quantization") or "").lower()
+    quant = (e.get("quantization") or "").strip().lower()
     for item in has:
         neg = item.startswith("!")
         token = item[1:] if neg else item
@@ -963,7 +938,7 @@ def _passes_has(e: dict, has: list[str]) -> bool:
         key, want = token.split(":", 1)
         if key != "quantization":
             return False
-        ok = quant == (want or "").lower()
+        ok = quant == (want or "").strip().lower()
         if ok == neg:
             return False
     return True
