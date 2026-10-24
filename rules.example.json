@@ -18,6 +18,7 @@
       "max_candidates": 4,
       "time_value_cents_per_s": 0.15,
       "session_affinity": true,
+      "session_ttl_s": 21600,
       "stats_ttl_s": 600,
       "precision_policy": {
         "strict_min_pool": 3,
